@@ -32,6 +32,7 @@ def main() -> int:
     parser.add_argument("--format", default="720", help="Source download resolution: 360 / 480 / 720 / 1080 (default: 720)")
     parser.add_argument("--language", default=None, help="Force Whisper language code, e.g. 'en' (default: auto-detect)")
     parser.add_argument("--output-json", default=None, help="Write the full result JSON to this path")
+    parser.add_argument("--debug", action="store_true", help="Write a debug overlay video for local mode")
     args = parser.parse_args()
 
     try:
@@ -42,6 +43,7 @@ def main() -> int:
             download_format=args.format,
             language=args.language,
             mode=args.mode,
+            debug=args.debug,
         )
     except Exception as e:
         print(f"\nFAILED: {e}", file=sys.stderr)
