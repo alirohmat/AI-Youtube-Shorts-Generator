@@ -33,7 +33,7 @@ Built for creators, agencies, and developers who don't want to pay $20–$300/mo
 - **🎤 Whisper Transcription, Your Choice**: Cloud (`/openai-whisper` via MuAPI) or local (`faster-whisper`, CPU or CUDA) — same downstream output shape
 - **🧩 Long-Video Aware**: Videos over 30 minutes are auto-chunked with overlap so nothing gets missed
 - **♻️ Smart Dedupe**: Overlapping highlights are collapsed by score so you never get two near-duplicate clips
-- **🎯 Smart Vertical Crop**: API mode uses MuAPI's auto-crop; local mode runs OpenCV face tracking with motion smoothing
+- **🎯 Smart Vertical Crop**: API mode uses MuAPI's auto-crop; local mode uses MediaPipe Pose + Face Mesh mouth-motion scoring + audio energy awareness, with OpenCV/Haar fallback and motion smoothing
 - **📱 Any Aspect Ratio**: 9:16 for TikTok/Reels/Shorts, 1:1 for square, anything else by flag
 - **🧰 CLI + Python Library**: Use it from the shell or import `generate_shorts(...)` into your own pipeline
 - **📦 JSON Output**: `--output-json` dumps the full result (transcript + every candidate highlight + final clip URLs/paths) for downstream automation
@@ -50,7 +50,7 @@ Don't want to self-host? The [AI Clipping API](https://muapi.ai/playground/ai-cl
 
 - Python 3.10+
 - For **API mode (default)**: a MuAPI key — powers download, transcription, highlight ranking, and clipping in a single dependency
-- For **Local mode** (`--mode local`): `ffmpeg` on your PATH and an LLM API key (`OPENAI_API_KEY` or `GEMINI_API_KEY`; only the LLM step is remote)
+- For **Local mode** (`--mode local`): `ffmpeg` on your PATH and an LLM API key (`OPENAI_API_KEY` or `GEMINI_API_KEY`; only the LLM step is remote), plus `mediapipe`, `opencv-python`, and `librosa` from `requirements-local.txt`
 
 ### Steps
 
@@ -86,10 +86,12 @@ Don't want to self-host? The [AI Clipping API](https://muapi.ai/playground/ai-cl
    OPENAI_MODEL=gpt-4o-mini          # optional, default gpt-4o-mini
    GEMINI_API_KEY=your_gemini_key_here
    GEMINI_MODEL=gemini-2.5-flash      # optional, default gemini-2.5-flash
-   LOCAL_WHISPER_MODEL=base          # tiny / base / small / medium / large-v3
-   LOCAL_WHISPER_DEVICE=auto         # auto / cpu / cuda
-   LOCAL_OUTPUT_DIR=output           # where local mp4s land
-   ```
+    LOCAL_WHISPER_MODEL=base          # tiny / base / small / medium / large-v3
+    LOCAL_WHISPER_DEVICE=auto         # auto / cpu / cuda
+    LOCAL_OUTPUT_DIR=output           # where local mp4s land
+    ```
+
+   If you plan to use debug cropping, the local runner will also write `output_debug.mp4` beside the rendered short so you can inspect the subject selection frame-by-frame.
 
 ## Usage
 
@@ -106,6 +108,14 @@ python main.py "https://www.youtube.com/watch?v=VIDEO_ID" --mode local
 ```
 
 Local mode writes the rendered shorts to `./output/short_01.mp4`, `short_02.mp4`, … (override with `LOCAL_OUTPUT_DIR`).
+
+To inspect the crop target, add `--debug`:
+
+```bash
+python main.py "https://www.youtube.com/watch?v=VIDEO_ID" --mode local --debug
+```
+
+Debug mode also writes `output_debug.mp4` in the output directory with a green box on the selected subject and on-screen `Score`, `Audio Energy`, and `Mouth Variance` values.
 
 ### With options
 
@@ -167,6 +177,7 @@ xargs -a urls.txt -I{} python main.py "{}"
 | `--format` | `720` | Source download resolution: `360` / `480` / `720` / `1080` |
 | `--language` | auto | Force Whisper language code (e.g. `en`) |
 | `--output-json` | — | Dump the full result (transcript + all candidates) to a file |
+| `--debug` | off | Local mode only. Writes `output_debug.mp4` with subject-selection overlays |
 
 ### API mode vs Local mode
 
@@ -175,7 +186,7 @@ xargs -a urls.txt -I{} python main.py "{}"
 | Download | MuAPI `/youtube-download` | `yt-dlp` for remote URLs, direct file path for local inputs |
 | Transcription | MuAPI `/openai-whisper` | `faster-whisper` (CPU or CUDA) |
 | Highlight LLM | MuAPI `gpt-5-mini` | `LLM_PROVIDER=openai` uses OpenAI (`gpt-4o-mini` by default), `LLM_PROVIDER=gemini` uses Gemini (`gemini-2.5-flash` by default) |
-| Vertical crop | MuAPI `/autocrop` | `ffmpeg` + OpenCV face tracking |
+| Vertical crop | MuAPI `/autocrop` | `ffmpeg` + MediaPipe Pose/Face Mesh + audio energy + OpenCV/Haar fallback |
 | Output | hosted URLs | local mp4 paths |
 | Required keys | `MUAPI_API_KEY` | `OPENAI_API_KEY` or `GEMINI_API_KEY` (+ `ffmpeg` on PATH) |
 
