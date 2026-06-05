@@ -14,9 +14,6 @@ from typing import Dict, List, Optional, Tuple
 
 import mediapipe as mp
 
-mp_face_mesh = mp.solutions.face_mesh
-mp_pose = mp.solutions.pose
-
 from ..config import LOCAL_OUTPUT_DIR
 
 
@@ -112,13 +109,11 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, debug: boo
         ) from e
 
     try:
-        _ = mp.solutions.face_mesh
-        _ = mp.solutions.pose
-    except AttributeError as e:
-        raise RuntimeError(
-            "This mediapipe build does not expose mp.solutions. Install a compatible version, for example:\n"
-            "    pip install mediapipe==0.10.9"
-        ) from e
+        mp_face_mesh = mp.solutions.face_mesh
+        mp_pose = mp.solutions.pose
+    except AttributeError:
+        mp_face_mesh = mp.face_mesh
+        mp_pose = mp.pose
 
     target_ratio = _ratio(aspect_ratio)
     cap = cv2.VideoCapture(in_path)
@@ -141,21 +136,30 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, debug: boo
     crop_h = max(2, crop_h - (crop_h % 2))
 
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    pose = mp_pose.Pose(
-        static_image_mode=False,
-        model_complexity=1,
-        smooth_landmarks=True,
-        enable_segmentation=False,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
-    face_mesh = mp_face_mesh.FaceMesh(
-        static_image_mode=False,
-        max_num_faces=5,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
+    pose = None
+    face_mesh = None
+    try:
+        pose = mp_pose.Pose(
+            static_image_mode=False,
+            model_complexity=1,
+            smooth_landmarks=True,
+            enable_segmentation=False,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        face_mesh = mp_face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=5,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+    except Exception:
+        if pose is not None:
+            pose.close()
+        if face_mesh is not None:
+            face_mesh.close()
+        raise
 
     silent_path = out_path + ".silent.mp4"
     debug_path = os.path.join(os.path.dirname(out_path), "output_debug.mp4") if debug else None
@@ -453,8 +457,10 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, debug: boo
             debug_writer.write(overlay)
 
     cap.release()
-    pose.close()
-    face_mesh.close()
+    if pose is not None:
+        pose.close()
+    if face_mesh is not None:
+        face_mesh.close()
     writer.release()
     if debug_writer is not None:
         debug_writer.release()
