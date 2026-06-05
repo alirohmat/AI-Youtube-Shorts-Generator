@@ -50,7 +50,7 @@ Don't want to self-host? The [AI Clipping API](https://muapi.ai/playground/ai-cl
 
 - Python 3.10+
 - For **API mode (default)**: a MuAPI key — powers download, transcription, highlight ranking, and clipping in a single dependency
-- For **Local mode** (`--mode local`): `ffmpeg` on your PATH and an LLM API key (`OPENAI_API_KEY` or `GEMINI_API_KEY`; only the LLM step is remote), plus `mediapipe`, `opencv-python`, and `librosa` from `requirements-local.txt`
+   - For **Local mode** (`--mode local`): `ffmpeg` on your PATH and an LLM API key (`OPENAI_API_KEY` or `GEMINI_API_KEY`; only the LLM step is remote), plus `mediapipe`, `opencv-python`, `librosa`, `ultralytics`, and `numpy` from `requirements-local.txt`
 
 ### Steps
 

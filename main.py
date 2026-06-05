@@ -33,6 +33,7 @@ def main() -> int:
     parser.add_argument("--language", default=None, help="Force Whisper language code, e.g. 'en' (default: auto-detect)")
     parser.add_argument("--output-json", default=None, help="Write the full result JSON to this path")
     parser.add_argument("--debug", action="store_true", help="Write a debug overlay video for local mode")
+    parser.add_argument("--podcast", action="store_true", help="Use the podcast crop pipeline in local mode")
     args = parser.parse_args()
 
     try:
@@ -44,6 +45,7 @@ def main() -> int:
             language=args.language,
             mode=args.mode,
             debug=args.debug,
+            podcast=args.podcast,
         )
     except Exception as e:
         print(f"\nFAILED: {e}", file=sys.stderr)
