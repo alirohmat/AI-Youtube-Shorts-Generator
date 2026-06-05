@@ -10,5 +10,6 @@ mediapipe>=0.10.18
 librosa==0.10.2.post1
 soundfile>=0.12.1
 numba>=0.59.0
+json5>=0.9.25
 # torch is only needed if you want CUDA Whisper. CPU works without it.
 # torch>=2.0

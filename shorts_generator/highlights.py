@@ -94,19 +94,40 @@ def call_muapi_llm(prompt: str) -> str:
     raise RuntimeError(f"Could not extract gpt-5-mini text from response: {result}")
 
 
+def clean_json_response(text: str) -> str:
+    """Extract the most likely JSON object from a noisy LLM response."""
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        cleaned = cleaned[start:end + 1]
+
+    # Best-effort validation that we are looking at a JSON-like object.
+    if not re.match(r"^\s*\{[\s\S]*\}\s*$", cleaned):
+        return cleaned
+    return cleaned
+
+
 def _parse_json_loose(raw: str) -> Dict:
-    """gpt-5-4 sometimes wraps JSON in markdown fences — strip and parse."""
-    text = raw.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
+    """Parse noisy JSON from LLMs with json5 fallback."""
+    text = clean_json_response(raw)
     try:
         return json.loads(text)
-    except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1:
-            return json.loads(text[start:end + 1])
-        raise
+    except Exception as first_error:
+        try:
+            import json5  # type: ignore
+        except Exception:
+            print(f"[json-parse] raw LLM response:\n{raw}", flush=True)
+            raise first_error
+
+        try:
+            return json5.loads(text)
+        except Exception:
+            print(f"[json-parse] raw LLM response:\n{raw}", flush=True)
+            raise
 
 
 def detect_content_type(transcript: Dict, llm_fn: LLMFn = call_muapi_llm) -> Dict[str, str]:
@@ -167,7 +188,11 @@ def call_highlight_api(
     )
     full_prompt = f"{system}\n\nTranscript:\n{transcript_text}"
     raw = llm_fn(full_prompt)
-    return _parse_json_loose(raw)
+    try:
+        return _parse_json_loose(raw)
+    except Exception:
+        print(f"[highlights] raw LLM response for debugging:\n{raw}", flush=True)
+        raise
 
 
 def dedupe_highlights(highlights: List[Dict]) -> List[Dict]:
