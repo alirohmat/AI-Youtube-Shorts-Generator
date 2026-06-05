@@ -114,6 +114,16 @@ def _active_segment(current_timestamp: float, srt_segments: Sequence[Dict]) -> O
     return None
 
 
+def _active_segments(current_timestamp: float, srt_segments: Sequence[Dict]) -> List[Dict]:
+    active: List[Dict] = []
+    for segment in srt_segments:
+        start = float(segment.get("start", 0.0) or 0.0)
+        end = float(segment.get("end", 0.0) or 0.0)
+        if start <= current_timestamp <= end:
+            active.append(segment)
+    return active
+
+
 def _slice_segments_for_clip(
     segments: Sequence[Dict],
     clip_start: float,
@@ -259,6 +269,9 @@ def get_stable_podcast_crop(
     locked_box = state.get("last_box")
     locked_ts = float(state.get("locked_ts", -1.0) or -1.0)
     last_seen_ts = float(state.get("last_seen_ts", -1.0) or -1.0)
+    overlap_lock_until = float(state.get("overlap_lock_until", 0.0) or 0.0)
+    pending_track_id = state.get("pending_track_id")
+    pending_since = float(state.get("pending_since", -1.0) or -1.0)
 
     def lower_face_motion_score(track: Dict) -> float:
         x0, y0, x1, y1 = [int(v) for v in track["bbox"]]
@@ -326,9 +339,34 @@ def get_stable_podcast_crop(
     print(f"[DEBUG] Motion score person 1: {motion_scores.get(1, 0.0)}", flush=True)
     print(f"[DEBUG] Motion score person 2: {motion_scores.get(2, 0.0)}", flush=True)
 
+    active_segments = _active_segments(current_timestamp, srt_segments)
+    overlap_detected = len(active_segments) > 1
+    if overlap_detected:
+        print(f"[OVERLAP] {len(active_segments)} speakers active. Locked ID: {locked_id}", flush=True)
+        if overlap_lock_until <= current_timestamp:
+            overlap_lock_until = current_timestamp + 3.0
+        state["overlap_lock_until"] = overlap_lock_until
+
     track_by_id = {int(t["track_id"]): t for t in tracks}
 
-    if locked_id is not None and locked_id in track_by_id and now_segment is None:
+    def pick_overlap_candidate() -> Optional[Dict]:
+        if not tracks:
+            return None
+        longest_seg = max(active_segments, key=lambda s: float(s.get("end", 0.0) or 0.0) - float(s.get("start", 0.0) or 0.0)) if active_segments else None
+        if longest_seg is not None:
+            print(f"[OVERLAP] longest active segment: {longest_seg}", flush=True)
+        scored = sorted(
+            tracks,
+            key=lambda t: (
+                t["face_area"],
+                motion_score_person(t),
+                center_distance_score(t),
+            ),
+            reverse=True,
+        )
+        return scored[0] if scored else None
+
+    if locked_id is not None and locked_id in track_by_id and now_segment is None and not overlap_detected:
         chosen = track_by_id[locked_id]
         state["last_seen_ts"] = current_timestamp
         box = normalize_box(tuple(chosen["bbox"]))
@@ -339,13 +377,28 @@ def get_stable_podcast_crop(
         print(f"[DEBUG] Final crop box: {box}", flush=True)
         return state["last_box"], state
 
+    if overlap_detected and locked_id is not None and locked_id in track_by_id and current_timestamp < overlap_lock_until:
+        chosen = track_by_id[locked_id]
+        state["last_seen_ts"] = current_timestamp
+        box = normalize_box(tuple(chosen["bbox"]))
+        if box is None:
+            return None, state
+        state["last_box"] = box
+        state["locked_ts"] = current_timestamp
+        state["pending_track_id"] = None
+        state["pending_since"] = -1.0
+        print(f"[DEBUG] Final crop box: {box}", flush=True)
+        return state["last_box"], state
+
     if locked_id is not None and locked_box is not None and last_seen_ts >= 0.0:
         if current_timestamp - last_seen_ts < (45.0 / 30.0):
             state["last_box"] = tuple(int(v) for v in locked_box)
             return state["last_box"], state
 
     candidate: Optional[Dict] = None
-    if now_segment is not None and tracks:
+    if overlap_detected:
+        candidate = pick_overlap_candidate()
+    elif now_segment is not None and tracks:
         scored = sorted(tracks, key=speaker_score, reverse=True)
         candidate = scored[0]
         for t in scored:
@@ -361,7 +414,31 @@ def get_stable_podcast_crop(
 
     if candidate is None:
         state["locked_id"] = None
+        state["pending_track_id"] = None
+        state["pending_since"] = -1.0
         return None, state
+
+    candidate_id = int(candidate["track_id"])
+    if overlap_detected and locked_id is not None and candidate_id != int(locked_id):
+        if pending_track_id != candidate_id:
+            state["pending_track_id"] = candidate_id
+            state["pending_since"] = current_timestamp
+            if locked_id in track_by_id:
+                preserved = normalize_box(tuple(track_by_id[locked_id]["bbox"]))
+                if preserved is not None:
+                    state["last_box"] = preserved
+                    print(f"[DEBUG] Final crop box: {preserved}", flush=True)
+                    return preserved, state
+        elif pending_since >= 0.0 and (current_timestamp - pending_since) < 1.5:
+            if locked_id in track_by_id:
+                preserved = normalize_box(tuple(track_by_id[locked_id]["bbox"]))
+                if preserved is not None:
+                    state["last_box"] = preserved
+                    print(f"[DEBUG] Final crop box: {preserved}", flush=True)
+                    return preserved, state
+        else:
+            state["pending_track_id"] = None
+            state["pending_since"] = -1.0
 
     box = normalize_box(tuple(candidate["bbox"]))
     if box is None:
@@ -369,10 +446,12 @@ def get_stable_podcast_crop(
     if locked_box is not None:
         box = _smooth_box(locked_box, box, 0.22)
 
-    state["locked_id"] = int(candidate["track_id"])
+    state["locked_id"] = candidate_id
     state["locked_ts"] = current_timestamp
     state["last_seen_ts"] = current_timestamp
     state["last_box"] = box
+    state["pending_track_id"] = None
+    state["pending_since"] = -1.0
     print(f"[DEBUG] Final crop box: {box}", flush=True)
     return box, state
 
