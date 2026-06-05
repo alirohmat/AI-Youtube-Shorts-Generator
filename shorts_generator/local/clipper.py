@@ -266,8 +266,6 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, debug: boo
         audio_energy is a sequence aligned with frame_index.
         """
 
-        previous_subject = previous_subject or None
-
         frame_h, frame_w = frame.shape[:2]
         energy = 0.0
         if audio_energy is not None:
@@ -349,16 +347,6 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, debug: boo
                 "audio_energy": energy,
                 "score": 0.0,
             }
-
-        if previous_subject is not None and previous_subject.get("score") is not None:
-            try:
-                prev_score = float(previous_subject.get("score", 0.0))
-                if prev_score > 0:
-                    delta = best_candidate["score"] - prev_score
-                    if delta / prev_score < 0.15:  # Hysteresis 15%
-                        return previous_subject
-            except Exception:
-                pass  # Abaikan jika error hitung, lanjut pilih kandidat baru
 
         return best_candidate
 
