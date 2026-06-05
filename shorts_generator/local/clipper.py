@@ -249,7 +249,6 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, debug: boo
         pose_data,
         audio_energy,
         frame_index: int,
-        previous_subject: Optional[Dict] = None,
     ) -> Dict:
         """Pick the best subject for the current frame.
 
@@ -396,9 +395,7 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, debug: boo
             pose_data=pose_data,
             audio_energy=audio_energy,
             frame_index=frame_index,
-            previous_subject=previous_subject,
         )
-        previous_subject = selected_subject
 
         next_center: Optional[Tuple[int, int]] = None
         if selected_subject and selected_subject.get("face_center"):
