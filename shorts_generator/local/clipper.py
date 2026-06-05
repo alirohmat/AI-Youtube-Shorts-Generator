@@ -261,6 +261,19 @@ def get_stable_podcast_crop(
         diff = cv2.absdiff(prev_roi, roi)
         return float(np.mean(diff))
 
+    def normalize_box(box: Tuple[float, float, float, float]) -> Optional[Tuple[int, int, int, int]]:
+        x1, y1, x2, y2 = [int(round(v)) for v in box]
+        x1 = max(0, min(x1, src_w))
+        y1 = max(0, min(y1, src_h))
+        x2 = max(0, min(x2, src_w))
+        y2 = max(0, min(y2, src_h))
+        w = x2 - x1
+        h = y2 - y1
+        if w < 100 or h < 100:
+            return None
+        print(f"[DEBUG] Crop box: x1={x1}, y1={y1}, w={w}, h={h}, frame_size={frame.shape}")
+        return (x1, y1, x2, y2)
+
     def center_distance_score(track: Dict) -> float:
         cx, cy = track["center"]
         return 1.0 - min(hypot(cx - (src_w / 2.0), cy - (src_h / 2.0)) / hypot(src_w, src_h), 1.0)
@@ -279,7 +292,10 @@ def get_stable_podcast_crop(
     if locked_id is not None and locked_id in track_by_id:
         chosen = track_by_id[locked_id]
         state["last_seen_ts"] = current_timestamp
-        state["last_box"] = tuple(int(v) for v in chosen["bbox"])
+        box = normalize_box(tuple(chosen["bbox"]))
+        if box is None:
+            return None, state
+        state["last_box"] = box
         state["locked_ts"] = current_timestamp
         return state["last_box"], state
 
@@ -305,7 +321,9 @@ def get_stable_podcast_crop(
         state["locked_id"] = None
         return None, state
 
-    box = tuple(int(v) for v in candidate["bbox"])
+    box = normalize_box(tuple(candidate["bbox"]))
+    if box is None:
+        return None, state
     if locked_box is not None:
         box = _smooth_box(locked_box, box, 0.22)
 
@@ -758,10 +776,13 @@ def _reframe_vertical_podcast_impl(
         prev_gray = state.get("prev_gray")
 
         if box is None:
-            raise ValueError("No stable crop found")
+            x0, y0, x1, y1 = _box_from_center(src_w / 2.0, src_h / 2.0, crop_w, crop_h, src_w, src_h)
+        else:
+            x0, y0, x1, y1 = box
 
-        x0, y0, x1, y1 = box
         cropped = frame[y0:y1, x0:x1]
+        if cropped.shape[0] != crop_h or cropped.shape[1] != crop_w:
+            cropped = cv2.resize(cropped, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
         writer.write(cropped)
 
         if debug and debug_writer is not None:
