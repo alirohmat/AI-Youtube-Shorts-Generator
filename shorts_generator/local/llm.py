@@ -3,6 +3,7 @@ from ..config import (
     GEMINI_MODEL,
     LLM_PROVIDER,
     OPENAI_MODEL,
+    OPENAI_BASE_URL,
     require_gemini_key,
     require_openai_key,
 )
@@ -18,7 +19,10 @@ def call_openai_llm(prompt: str) -> str:
             "    pip install -r requirements-local.txt"
         ) from e
 
-    client = OpenAI(api_key=require_openai_key())
+    client_kwargs = {"api_key": require_openai_key()}
+    if OPENAI_BASE_URL:
+        client_kwargs["base_url"] = OPENAI_BASE_URL
+    client = OpenAI(**client_kwargs)
     response = client.chat.completions.create(
         model=OPENAI_MODEL,
         temperature=0.7,
