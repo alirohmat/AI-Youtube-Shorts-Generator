@@ -67,11 +67,13 @@ Don't want to self-host? The [AI Clipping API](https://muapi.ai/playground/ai-cl
    ```
 
 3. **Install Python dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   # Only if you plan to use --mode local:
-   pip install -r requirements-local.txt
-   ```
+    ```bash
+    pip install -r requirements.txt
+    # Only if you plan to use --mode local:
+    pip install -r requirements-local.txt
+    # Colab / CPU-safe MediaPipe pin used by this repo:
+    pip install mediapipe==0.10.9
+    ```
 
 4. **Set up environment variables:**
 

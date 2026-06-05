@@ -12,6 +12,11 @@ from collections import deque
 from math import hypot
 from typing import Dict, List, Optional, Tuple
 
+import mediapipe as mp
+
+mp_face_mesh = mp.solutions.face_mesh
+mp_pose = mp.solutions.pose
+
 from ..config import LOCAL_OUTPUT_DIR
 
 
@@ -53,8 +58,18 @@ def extract_audio_energy_array(video_path: str, fps: float) -> List[float]:
             "    pip install -r requirements-local.txt"
         ) from e
 
+    # Prefer soundfile to avoid audioread deprecation warnings when available.
     try:
-        y, sr = librosa.load(video_path, sr=None, mono=True)
+        import soundfile as _soundfile  # type: ignore
+        _ = _soundfile  # keep import explicit for readability
+    except Exception:
+        pass
+
+    try:
+        try:
+            y, sr = librosa.load(video_path, sr=16000, mono=True, backend="soundfile")
+        except TypeError:
+            y, sr = librosa.load(video_path, sr=16000, mono=True)
     except Exception as e:
         raise RuntimeError(f"failed to load audio from {video_path}: {e}") from e
 
@@ -97,11 +112,12 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, debug: boo
         ) from e
 
     try:
-        import mediapipe as mp  # type: ignore
-    except ImportError as e:
+        _ = mp.solutions.face_mesh
+        _ = mp.solutions.pose
+    except AttributeError as e:
         raise RuntimeError(
-            "mediapipe is required for the smarter local cropper. Install it with:\n"
-            "    pip install -r requirements-local.txt"
+            "This mediapipe build does not expose mp.solutions. Install a compatible version, for example:\n"
+            "    pip install mediapipe==0.10.9"
         ) from e
 
     target_ratio = _ratio(aspect_ratio)
@@ -125,7 +141,7 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, debug: boo
     crop_h = max(2, crop_h - (crop_h % 2))
 
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    pose = mp.solutions.pose.Pose(
+    pose = mp_pose.Pose(
         static_image_mode=False,
         model_complexity=1,
         smooth_landmarks=True,
@@ -133,9 +149,9 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, debug: boo
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     )
-    face_mesh = mp.solutions.face_mesh.FaceMesh(
+    face_mesh = mp_face_mesh.FaceMesh(
         static_image_mode=False,
-        max_num_faces=3,
+        max_num_faces=5,
         refine_landmarks=True,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
@@ -150,8 +166,8 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, debug: boo
     last_center: Optional[Tuple[int, int]] = None
     smoothing = 0.18  # how aggressively to chase a new subject position
 
-    lip_top = mp.solutions.face_mesh.FaceMeshLandmark.UPPER_LIP_TOP if hasattr(mp.solutions.face_mesh, "FaceMeshLandmark") else 13
-    lip_bottom = mp.solutions.face_mesh.FaceMeshLandmark.LOWER_LIP_BOTTOM if hasattr(mp.solutions.face_mesh, "FaceMeshLandmark") else 14
+    lip_top = 13
+    lip_bottom = 14
     mouth_history: Dict[int, deque] = {}
 
     def _landmark_xy(frame, lm) -> Tuple[int, int]:
@@ -162,18 +178,18 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, debug: boo
         h, w, _ = frame.shape
         candidates: List[Tuple[Tuple[int, int], float]] = []
         for landmark, weight in (
-            (mp.solutions.pose.PoseLandmark.NOSE, 3.0),
-            (mp.solutions.pose.PoseLandmark.LEFT_SHOULDER, 2.0),
-            (mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER, 2.0),
-            (mp.solutions.pose.PoseLandmark.LEFT_HIP, 1.5),
-            (mp.solutions.pose.PoseLandmark.RIGHT_HIP, 1.5),
+            (mp_pose.PoseLandmark.NOSE, 3.0),
+            (mp_pose.PoseLandmark.LEFT_SHOULDER, 2.0),
+            (mp_pose.PoseLandmark.RIGHT_SHOULDER, 2.0),
+            (mp_pose.PoseLandmark.LEFT_HIP, 1.5),
+            (mp_pose.PoseLandmark.RIGHT_HIP, 1.5),
         ):
             lm = landmarks.landmark[landmark]
             if lm.visibility < 0.45:
                 continue
             candidates.append(((int(lm.x * w), int(lm.y * h)), weight))
         if not candidates:
-            nose = landmarks.landmark[mp.solutions.pose.PoseLandmark.NOSE]
+            nose = landmarks.landmark[mp_pose.PoseLandmark.NOSE]
             if nose.visibility < 0.3:
                 return None
             return int(nose.x * w), int(nose.y * h)
