@@ -41,6 +41,17 @@ def _crop_size(src_w: int, src_h: int, target_ratio: float) -> Tuple[int, int]:
     return crop_w, crop_h
 
 
+def _fit_ratio(crop_w: int, crop_h: int, target_ratio: float) -> Tuple[int, int]:
+    current_ratio = crop_w / float(max(crop_h, 1))
+    if current_ratio > target_ratio:
+        crop_w = int(crop_h * target_ratio)
+    else:
+        crop_h = int(crop_w / target_ratio)
+    crop_w = max(2, crop_w - (crop_w % 2))
+    crop_h = max(2, crop_h - (crop_h % 2))
+    return crop_w, crop_h
+
+
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
@@ -224,7 +235,8 @@ def get_stable_podcast_crop(
     """
     state = dict(prev_state or {})
     src_h, src_w = frame.shape[:2]
-    crop_w, crop_h = _crop_size(src_w, src_h, _ratio("9:16"))
+    target_ratio = _ratio("9:16")
+    crop_w, crop_h = _fit_ratio(*_crop_size(src_w, src_h, target_ratio), target_ratio)
 
     model = _get_yolo_model()
     if model is None:
@@ -261,6 +273,26 @@ def get_stable_podcast_crop(
         diff = cv2.absdiff(prev_roi, roi)
         return float(np.mean(diff))
 
+    def mouth_motion_score(track: Dict) -> float:
+        x0, y0, x1, y1 = [int(v) for v in track["bbox"]]
+        w = max(1, x1 - x0)
+        h = max(1, y1 - y0)
+        mouth_top = y0 + int(h * 0.60)
+        mouth_bottom = y0 + int(h * 0.88)
+        mouth_left = x0 + int(w * 0.25)
+        mouth_right = x0 + int(w * 0.75)
+        roi = gray[mouth_top:mouth_bottom, mouth_left:mouth_right]
+        if roi.size == 0 or prev_gray is None:
+            return 0.0
+        prev_roi = prev_gray[mouth_top:mouth_bottom, mouth_left:mouth_right]
+        if prev_roi.size == 0:
+            return 0.0
+        diff = cv2.absdiff(prev_roi, roi)
+        return float(np.mean(diff))
+
+    def motion_score_person(track: Dict) -> float:
+        return mouth_motion_score(track)
+
     def normalize_box(box: Tuple[float, float, float, float]) -> Optional[Tuple[int, int, int, int]]:
         x1, y1, x2, y2 = [int(round(v)) for v in box]
         x1 = max(0, min(x1, src_w))
@@ -271,7 +303,6 @@ def get_stable_podcast_crop(
         h = y2 - y1
         if w < 100 or h < 100:
             return None
-        print(f"[DEBUG] Crop box: x1={x1}, y1={y1}, w={w}, h={h}, frame_size={frame.shape}")
         return (x1, y1, x2, y2)
 
     def center_distance_score(track: Dict) -> float:
@@ -284,12 +315,20 @@ def get_stable_podcast_crop(
             score += 0.55
         score += 0.25 * center_distance_score(track)
         score += 0.20 * min(track["face_area"] / float(src_w * src_h), 0.25) / 0.25
-        score += min(lower_face_motion_score(track) / 22.0, 1.0) * 0.25
+        score += min(mouth_motion_score(track) / 22.0, 1.0) * 0.35
         return score
+
+    motion_scores = {int(t["track_id"]): motion_score_person(t) for t in tracks}
+    print(f"[DEBUG] Timestamp: {current_timestamp}s", flush=True)
+    print(f"[DEBUG] Active SRT segment: {now_segment}", flush=True)
+    print(f"[DEBUG] Tracked persons: {[int(t['track_id']) for t in tracks]}", flush=True)
+    print(f"[DEBUG] Locked ID: {locked_id}", flush=True)
+    print(f"[DEBUG] Motion score person 1: {motion_scores.get(1, 0.0)}", flush=True)
+    print(f"[DEBUG] Motion score person 2: {motion_scores.get(2, 0.0)}", flush=True)
 
     track_by_id = {int(t["track_id"]): t for t in tracks}
 
-    if locked_id is not None and locked_id in track_by_id:
+    if locked_id is not None and locked_id in track_by_id and now_segment is None:
         chosen = track_by_id[locked_id]
         state["last_seen_ts"] = current_timestamp
         box = normalize_box(tuple(chosen["bbox"]))
@@ -297,6 +336,7 @@ def get_stable_podcast_crop(
             return None, state
         state["last_box"] = box
         state["locked_ts"] = current_timestamp
+        print(f"[DEBUG] Final crop box: {box}", flush=True)
         return state["last_box"], state
 
     if locked_id is not None and locked_box is not None and last_seen_ts >= 0.0:
@@ -305,17 +345,19 @@ def get_stable_podcast_crop(
             return state["last_box"], state
 
     candidate: Optional[Dict] = None
-    if speech_active and tracks:
+    if now_segment is not None and tracks:
         scored = sorted(tracks, key=speaker_score, reverse=True)
+        candidate = scored[0]
         for t in scored:
-            if lower_face_motion_score(t) > 8.0:
+            if motion_score_person(t) > 6.0:
                 candidate = t
                 break
-        if candidate is None:
-            candidate = scored[0]
 
     if candidate is None and tracks:
         candidate = max(tracks, key=lambda t: t["face_area"])
+
+    if candidate is None and locked_id is not None and locked_id in track_by_id:
+        candidate = track_by_id[locked_id]
 
     if candidate is None:
         state["locked_id"] = None
@@ -331,6 +373,7 @@ def get_stable_podcast_crop(
     state["locked_ts"] = current_timestamp
     state["last_seen_ts"] = current_timestamp
     state["last_box"] = box
+    print(f"[DEBUG] Final crop box: {box}", flush=True)
     return box, state
 
 
@@ -435,7 +478,7 @@ def _reframe_vertical(
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     audio_energy = extract_audio_energy_array(in_path, fps)
 
-    crop_w, crop_h = _crop_size(src_w, src_h, target_ratio)
+    crop_w, crop_h = _fit_ratio(*_crop_size(src_w, src_h, target_ratio), target_ratio)
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
     silent_path = out_path + ".silent.mp4"
