@@ -76,6 +76,21 @@ def _box_from_center(
     return x0, y0, x0 + crop_w, y0 + crop_h
 
 
+def _box_from_anchor(
+    anchor_x: float,
+    anchor_y: float,
+    crop_w: int,
+    crop_h: int,
+    src_w: int,
+    src_h: int,
+) -> Tuple[int, int, int, int]:
+    x0 = int(round(anchor_x - crop_w / 2.0))
+    y0 = int(round(anchor_y - crop_h / 2.0))
+    x0 = int(_clamp(x0, 0, max(0, src_w - crop_w)))
+    y0 = int(_clamp(y0, 0, max(0, src_h - crop_h)))
+    return x0, y0, x0 + crop_w, y0 + crop_h
+
+
 def _box_wh(box: Tuple[float, float, float, float]) -> Tuple[float, float]:
     x0, y0, x1, y1 = box
     return max(1.0, x1 - x0), max(1.0, y1 - y0)
@@ -305,6 +320,22 @@ def get_stable_podcast_crop(
 
     def motion_score_person(track: Dict) -> float:
         return mouth_motion_score(track)
+
+    def torso_anchor(track: Dict) -> Tuple[float, float]:
+        """Use a stable torso anchor instead of the face center.
+
+        This reduces jitter when the speaker turns their head or looks down.
+        """
+        x0, y0, x1, y1 = [float(v) for v in track["bbox"]]
+        w = max(1.0, x1 - x0)
+        h = max(1.0, y1 - y0)
+        anchor_x = x0 + (w / 2.0)
+        anchor_y = y0 + (h * 0.65)
+
+        prev_anchor_y = state.get("anchor_y_smoothed")
+        anchor_y = _smooth_value(float(prev_anchor_y) if prev_anchor_y is not None else None, anchor_y, 0.18)
+        state["anchor_y_smoothed"] = anchor_y
+        return anchor_x, anchor_y
 
     def normalize_box(box: Tuple[float, float, float, float]) -> Optional[Tuple[int, int, int, int]]:
         x1, y1, x2, y2 = [int(round(v)) for v in box]
@@ -900,7 +931,11 @@ def _reframe_vertical_podcast_impl(
         if box is None:
             x0, y0, x1, y1 = _box_from_center(src_w / 2.0, src_h / 2.0, crop_w, crop_h, src_w, src_h)
         else:
-            x0, y0, x1, y1 = box
+            # Anchor crop on the torso so head turns do not drag the crop window.
+            x0b, y0b, x1b, y1b = box
+            anchor_x = (x0b + x1b) / 2.0
+            anchor_y = y0b + ((y1b - y0b) * 0.65)
+            x0, y0, x1, y1 = _box_from_anchor(anchor_x, anchor_y, crop_w, crop_h, src_w, src_h)
 
         cropped = frame[y0:y1, x0:x1]
         if cropped.shape[0] != crop_h or cropped.shape[1] != crop_w:
