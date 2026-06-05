@@ -6,7 +6,7 @@ faster-whisper>=1.0.0
 openai>=1.0.0
 google-genai>=1.0.0
 opencv-python>=4.8.0
-mediapipe==0.10.9
+mediapipe>=0.10.18
 librosa==0.10.2.post1
 soundfile>=0.12.1
 numba>=0.59.0

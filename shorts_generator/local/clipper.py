@@ -109,11 +109,13 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, debug: boo
         ) from e
 
     try:
+        FaceMesh = mp.solutions.face_mesh.FaceMesh
+        Pose = mp.solutions.pose.Pose
         mp_face_mesh = mp.solutions.face_mesh
         mp_pose = mp.solutions.pose
-    except AttributeError:
-        mp_face_mesh = mp.face_mesh
-        mp_pose = mp.pose
+    except Exception as e:
+        print(f"MediaPipe init error: {e}")
+        raise
 
     target_ratio = _ratio(aspect_ratio)
     cap = cv2.VideoCapture(in_path)
@@ -139,7 +141,7 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, debug: boo
     pose = None
     face_mesh = None
     try:
-        pose = mp_pose.Pose(
+        pose = Pose(
             static_image_mode=False,
             model_complexity=1,
             smooth_landmarks=True,
@@ -147,7 +149,7 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, debug: boo
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
         )
-        face_mesh = mp_face_mesh.FaceMesh(
+        face_mesh = FaceMesh(
             static_image_mode=False,
             max_num_faces=5,
             refine_landmarks=True,
@@ -170,8 +172,6 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str, debug: boo
     last_center: Optional[Tuple[int, int]] = None
     smoothing = 0.18  # how aggressively to chase a new subject position
 
-    lip_top = 13
-    lip_bottom = 14
     mouth_history: Dict[int, deque] = {}
 
     def _landmark_xy(frame, lm) -> Tuple[int, int]:
