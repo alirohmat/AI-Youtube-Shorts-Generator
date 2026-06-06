@@ -92,7 +92,13 @@ def _existing_download(out_dir: str, video_id: str) -> Optional[str]:
     return None
 
 
-def download_youtube_local(video_url: str, fmt: str = "720", out_dir: Optional[str] = None) -> str:
+def download_youtube_local(
+    video_url: str,
+    fmt: str = "720",
+    out_dir: Optional[str] = None,
+    cookies: Optional[str] = None,
+    cookies_from_browser: Optional[str] = None,
+) -> str:
     """Download a remote URL or return a local file path unchanged."""
     local_path = _resolve_local_path(video_url)
     if local_path:
@@ -120,11 +126,11 @@ def download_youtube_local(video_url: str, fmt: str = "720", out_dir: Optional[s
         "noprogress": True,
     }
 
-    cookies_file = os.getenv("YTDLP_COOKIES_FILE")
+    cookies_file = cookies or os.getenv("YTDLP_COOKIES_FILE")
     if cookies_file:
         ydl_opts["cookiefile"] = cookies_file
 
-    cookies_from_browser = os.getenv("YTDLP_COOKIES_FROM_BROWSER")
+    cookies_from_browser = cookies_from_browser or os.getenv("YTDLP_COOKIES_FROM_BROWSER")
     if cookies_from_browser:
         browser_spec = cookies_from_browser.strip()
         if browser_spec.lower() not in ("1", "true", "yes", "on"):
