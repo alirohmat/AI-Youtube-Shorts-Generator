@@ -11,10 +11,7 @@ drive either MuAPI (default, --mode api) or a direct local LLM client
 (--mode local).
 """
 import json
-import os
-import hashlib
 import re
-from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from . import muapi
@@ -57,132 +54,17 @@ Rules:
 - Clips must not overlap significantly with each other
 - Score 0-100 on viral potential (not general quality)
 - {num_clips_instruction}
- - For each highlight, identify the single best "hook_sentence" — the opening line that would make someone stop scrolling
- - If the clip clearly centers on a real-world entity, set `entity` to that name; otherwise use null
- - If `entity` is present, set `search_query` to a short query that would help verify the entity and context; otherwise use null
- - Set `intro_hook` to a polished opening line for the clip
- - Set `on_screen_text` to short caption text suitable for an overlay/title card
- - Explain in one sentence why this clip is viral ("virality_reason")
+- For each highlight, identify the single best "hook_sentence" — the opening line that would make someone stop scrolling
+- Explain in one sentence why this clip is viral ("virality_reason")
 
 Respond ONLY with valid JSON (no markdown, no explanation):
-{{"highlights":[{{"title":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string","entity":null,"search_query":null,"intro_hook":"string","on_screen_text":"string"}}]}}"""
+{{"highlights":[{{"title":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string"}}]}}"""
 
 
 CHUNK_SIZE_SECONDS = 1200       # 20-min chunks for long videos
 LONG_VIDEO_THRESHOLD = 1800     # chunk videos longer than 30 min
 CHUNK_OVERLAP_SECONDS = 60
 GPT_CALL_TIMEOUT_SECONDS = 300  # cap LLM polls at 5 min — a wedged call should fail fast
-RESEARCH_CACHE_DIR = Path(".cache/research")
-
-
-def _normalize_cache_key(text: str) -> str:
-    return hashlib.sha256(text.strip().lower().encode("utf-8")).hexdigest()
-
-
-def _research_cache_path(query: str) -> Path:
-    return RESEARCH_CACHE_DIR / f"{_normalize_cache_key(query)}.json"
-
-
-def _load_research_cache(query: str) -> Optional[Dict]:
-    path = _research_cache_path(query)
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
-
-def _save_research_cache(query: str, payload: Dict) -> None:
-    RESEARCH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    _research_cache_path(query).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def _search_tavily(query: str) -> List[Dict]:
-    api_key = os.getenv("TAVILY_API_KEY")
-    if not api_key:
-        return []
-    try:
-        from tavily import TavilyClient
-    except Exception:
-        return []
-    try:
-        client = TavilyClient(api_key=api_key)
-        result = client.search(query=query, max_results=5, include_answer=False)
-        return result.get("results", []) if isinstance(result, dict) else []
-    except Exception:
-        return []
-
-
-def _search_wikipedia(query: str) -> List[Dict]:
-    try:
-        import wikipedia
-    except Exception:
-        return []
-    try:
-        wikipedia.set_lang("id")
-    except Exception:
-        return []
-    try:
-        titles = wikipedia.search(query, results=5)
-    except Exception:
-        return []
-    results: List[Dict] = []
-    for title in titles[:5]:
-        try:
-            page = wikipedia.page(title, auto_suggest=False)
-            results.append({"title": page.title, "url": page.url, "summary": page.summary[:1200]})
-        except Exception:
-            continue
-    return results
-
-
-def _search_duckduckgo(query: str) -> List[Dict]:
-    try:
-        from duckduckgo_search import DDGS
-    except Exception:
-        return []
-    try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=5))
-    except Exception:
-        return []
-    return [
-        {"title": r.get("title"), "url": r.get("href") or r.get("url"), "snippet": r.get("body") or r.get("snippet")}
-        for r in results
-        if isinstance(r, dict)
-    ]
-
-
-def _research_entity(query: str) -> Dict:
-    cached = _load_research_cache(query)
-    if cached is not None:
-        return cached
-    payload = {
-        "query": query,
-        "sources": {
-            "tavily": _search_tavily(query),
-            "wikipedia": _search_wikipedia(query),
-            "duckduckgo": _search_duckduckgo(query),
-        },
-    }
-    _save_research_cache(query, payload)
-    return payload
-
-
-def _refine_intro_hook(llm_fn: LLMFn, highlight: Dict, research: Dict) -> str:
-    prompt = (
-        "Refine the intro hook for a short-form video clip using the factual context below. "
-        "Keep it punchy, natural, and curiosity-driven. Do not invent facts. "
-        "Return only the rewritten intro_hook text.\n\n"
-        f"Highlight title: {highlight.get('title', '')}\n"
-        f"Current intro_hook: {highlight.get('intro_hook') or highlight.get('hook_sentence') or ''}\n"
-        f"Entity: {highlight.get('entity')}\n"
-        f"Search query: {highlight.get('search_query')}\n"
-        f"Research context: {json.dumps(research, ensure_ascii=False)}"
-    )
-    refined = llm_fn(prompt).strip()
-    return refined.strip('"') if refined else (highlight.get('intro_hook') or highlight.get('hook_sentence') or "")
 
 
 def call_muapi_llm(prompt: str) -> str:
@@ -367,15 +249,5 @@ def get_highlights(
         text = build_transcript_text(transcript)
         result = call_highlight_api(text, content_info, duration, num_clips=num_clips, llm_fn=llm_fn)
         highlights = dedupe_highlights(result.get("highlights", []))
-
-    for highlight in highlights:
-        highlight.setdefault("entity", None)
-        highlight.setdefault("search_query", None)
-        highlight.setdefault("intro_hook", highlight.get("hook_sentence", ""))
-        highlight.setdefault("on_screen_text", highlight.get("title", ""))
-        entity = highlight.get("entity")
-        if entity:
-            research = _research_entity(str(highlight.get("search_query") or entity))
-            highlight["intro_hook"] = _refine_intro_hook(llm_fn, highlight, research)
 
     return {"highlights": highlights}

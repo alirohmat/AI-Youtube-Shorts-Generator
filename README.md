@@ -29,9 +29,7 @@ Built for creators, agencies, and developers who don't want to pay $20–$300/mo
 - **🎬 YouTube In, Vertical Out**: Hand it any YouTube URL — get back N viral-ready 9:16 mp4s
 - **🔀 Two Modes — API (fast) or Local (offline)**: Default `--mode api` uses MuAPI for download/transcription/cropping; `--mode local` runs entirely on your machine with `yt-dlp`, `faster-whisper`, and `ffmpeg`/`opencv`, and lets you pick OpenAI or Gemini for highlight ranking
 - **🤖 Virality-Aware Highlight Selection**: Clips ranked on hooks, emotional peaks, opinion bombs, revelation moments, conflict, quotable lines, story peaks, and practical value — not just generic "interesting"
-- **🧠 Context Wrapping**: Highlight JSON now includes `entity`, `search_query`, `intro_hook`, and `on_screen_text`; when an entity is detected, the app can refine the intro hook with researched context from Tavily/Wikipedia/DuckDuckGo and cache it locally
 - **📈 Score + Hook + Reason for Every Clip**: Each highlight comes with a viral score, an opening hook line, and a one-sentence explanation of why it works
-- **🔎 Research Cache**: Entity research is cached in `.cache/research/` so repeated runs do not re-fetch the same facts
 - **🎤 Whisper Transcription, Your Choice**: Cloud (`/openai-whisper` via MuAPI) or local (`faster-whisper`, CPU or CUDA) — same downstream output shape
 - **🧩 Long-Video Aware**: Videos over 30 minutes are auto-chunked with overlap so nothing gets missed
 - **♻️ Smart Dedupe**: Overlapping highlights are collapsed by score so you never get two near-duplicate clips
@@ -53,7 +51,6 @@ Don't want to self-host? The [AI Clipping API](https://muapi.ai/playground/ai-cl
 - Python 3.10+
 - For **API mode (default)**: a MuAPI key — powers download, transcription, highlight ranking, and clipping in a single dependency
 - For **Local mode** (`--mode local`): `ffmpeg` on your PATH and an LLM API key (`OPENAI_API_KEY` or `GEMINI_API_KEY`; only the LLM step is remote), plus the packages listed in `requirements-local.txt` (`mediapipe`, `opencv-python`, `ultralytics`, `numpy`, `librosa`, `soundfile`, `numba`, `json5`, etc.)
-- For **Context Wrapping**: `TAVILY_API_KEY` is optional. If present, Tavily is used first; otherwise the app falls back to Wikipedia and DuckDuckGo. Results are cached locally under `.cache/research/`.
 
 ### Steps
 
@@ -214,10 +211,9 @@ xargs -a urls.txt -I{} python main.py "{}"
 3. **Detect content type**: An LLM classifies the video (podcast, interview, tutorial, vlog, etc.) and density, so the prompt can be tuned per content style
 4. **Long-video chunking**: Videos > 30 min are split into 20-min overlapping chunks
 5. **Highlight ranking**: An LLM scans the transcript through a virality framework — hook moments, emotional peaks, opinion bombs, revelations, conflict, quotables, story peaks, practical value — and emits ranked candidates with scores 0–100
-6. **Context wrapping**: If a highlight has an `entity`, the app fetches supporting facts from Tavily, Wikipedia, and DuckDuckGo, caches them in `.cache/research/`, and asks the LLM to refine `intro_hook`
-7. **Dedupe**: Overlapping candidates are collapsed by score (>50% overlap → keep the higher score)
-8. **Top-N selection**: The top `--num-clips` candidates are selected
-9. **Auto-crop**: Each highlight is rendered as a vertical short at the requested aspect ratio
+6. **Dedupe**: Overlapping candidates are collapsed by score (>50% overlap → keep the higher score)
+7. **Top-N selection**: The top `--num-clips` candidates are selected
+8. **Auto-crop**: Each highlight is rendered as a vertical short at the requested aspect ratio
 
 If `--podcast` is enabled in local mode, the crop stage uses person tracking and transcript timing to favor the active speaker instead of generic center framing.
 
