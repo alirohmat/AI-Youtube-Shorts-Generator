@@ -22,13 +22,20 @@ def _run_local(
     language: Optional[str],
     debug: bool = False,
     podcast: bool = False,
+    cookies: Optional[str] = None,
+    cookies_from_browser: Optional[str] = None,
 ) -> Dict:
     from .local.clipper import crop_highlights_local
     from .local.downloader import download_youtube_local
     from .local.llm import call_local_llm
     from .local.transcriber import transcribe_local
 
-    source_path = download_youtube_local(youtube_url, fmt=download_format)
+    source_path = download_youtube_local(
+        youtube_url,
+        fmt=download_format,
+        cookies=cookies,
+        cookies_from_browser=cookies_from_browser,
+    )
 
     transcript = transcribe_local(source_path, language=language)
     if not transcript["segments"]:
@@ -105,6 +112,8 @@ def generate_shorts(
     mode: str = "api",
     debug: bool = False,
     podcast: bool = False,
+    cookies: Optional[str] = None,
+    cookies_from_browser: Optional[str] = None,
 ) -> Dict:
     """Run the full pipeline and return a structured result.
 
@@ -136,6 +145,8 @@ def generate_shorts(
             language,
             debug=debug,
             podcast=podcast,
+            cookies=cookies,
+            cookies_from_browser=cookies_from_browser,
         )
     if mode == "api":
         return _run_api(youtube_url, num_clips, aspect_ratio, download_format, language)

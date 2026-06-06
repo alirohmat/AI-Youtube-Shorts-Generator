@@ -34,6 +34,12 @@ def main() -> int:
     parser.add_argument("--output-json", default=None, help="Write the full result JSON to this path")
     parser.add_argument("--debug", action="store_true", help="Write a debug overlay video for local mode")
     parser.add_argument("--podcast", action="store_true", help="Use the podcast crop pipeline in local mode")
+    parser.add_argument("--cookies", default=None, help="Path to a cookies.txt file for yt-dlp (local mode only)")
+    parser.add_argument(
+        "--cookies-from-browser",
+        default=None,
+        help="Browser name or browser,profile[,keyring] for yt-dlp cookie extraction (local mode only)",
+    )
     args = parser.parse_args()
 
     try:
@@ -46,6 +52,8 @@ def main() -> int:
             mode=args.mode,
             debug=args.debug,
             podcast=args.podcast,
+            cookies=args.cookies,
+            cookies_from_browser=args.cookies_from_browser,
         )
     except Exception as e:
         print(f"\nFAILED: {e}", file=sys.stderr)

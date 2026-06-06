@@ -28,6 +28,7 @@ Built for creators, agencies, and developers who don't want to pay $20–$300/mo
 
 - **🎬 YouTube In, Vertical Out**: Hand it any YouTube URL — get back N viral-ready 9:16 mp4s
 - **🔀 Two Modes — API (fast) or Local (offline)**: Default `--mode api` uses MuAPI for download/transcription/cropping; `--mode local` runs entirely on your machine with `yt-dlp`, `faster-whisper`, and `ffmpeg`/`opencv`, and lets you pick OpenAI or Gemini for highlight ranking
+- **🍪 Cookie Support for yt-dlp**: Local mode can use `--cookies` or `--cookies-from-browser` to handle YouTube bot checks and restricted downloads
 - **🤖 Virality-Aware Highlight Selection**: Clips ranked on hooks, emotional peaks, opinion bombs, revelation moments, conflict, quotable lines, story peaks, and practical value — not just generic "interesting"
 - **📈 Score + Hook + Reason for Every Clip**: Each highlight comes with a viral score, an opening hook line, and a one-sentence explanation of why it works
 - **🎤 Whisper Transcription, Your Choice**: Cloud (`/openai-whisper` via MuAPI) or local (`faster-whisper`, CPU or CUDA) — same downstream output shape
@@ -51,6 +52,7 @@ Don't want to self-host? The [AI Clipping API](https://muapi.ai/playground/ai-cl
 - Python 3.10+
 - For **API mode (default)**: a MuAPI key — powers download, transcription, highlight ranking, and clipping in a single dependency
 - For **Local mode** (`--mode local`): `ffmpeg` on your PATH and an LLM API key (`OPENAI_API_KEY` or `GEMINI_API_KEY`; only the LLM step is remote), plus the packages listed in `requirements-local.txt` (`mediapipe`, `opencv-python`, `ultralytics`, `numpy`, `librosa`, `soundfile`, `numba`, `json5`, etc.)
+- For **YouTube downloads that require auth**: pass `--cookies /path/to/cookies.txt` or `--cookies-from-browser chrome` (or set `YTDLP_COOKIES_FILE` / `YTDLP_COOKIES_FROM_BROWSER`)
 
 ### Steps
 
@@ -118,6 +120,13 @@ To inspect the crop target, add `--debug`:
 
 ```bash
 python main.py "https://www.youtube.com/watch?v=VIDEO_ID" --mode local --debug
+```
+
+If YouTube asks you to sign in, try cookie support:
+
+```bash
+python main.py "https://www.youtube.com/watch?v=VIDEO_ID" --mode local --cookies /path/to/cookies.txt
+python main.py "https://www.youtube.com/watch?v=VIDEO_ID" --mode local --cookies-from-browser chrome
 ```
 
 Debug mode also writes `output_debug.mp4` in the output directory with a green box on the selected subject and on-screen `Score`, `Audio Energy`, and `Mouth Variance` values.
@@ -192,6 +201,8 @@ xargs -a urls.txt -I{} python main.py "{}"
 | `--output-json` | — | Dump the full result (transcript + all candidates) to a file |
 | `--debug` | off | Local mode only. Writes `output_debug.mp4` with subject-selection overlays |
 | `--podcast` | off | Local mode only. Enables the YOLOv8 + ByteTrack podcast crop pipeline |
+| `--cookies` | — | Local mode only. Path to a `cookies.txt` file for `yt-dlp` |
+| `--cookies-from-browser` | — | Local mode only. Extract cookies from a browser profile for `yt-dlp` |
 
 ### API mode vs Local mode
 

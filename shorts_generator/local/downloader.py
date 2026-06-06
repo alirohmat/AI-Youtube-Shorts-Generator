@@ -120,6 +120,16 @@ def download_youtube_local(video_url: str, fmt: str = "720", out_dir: Optional[s
         "noprogress": True,
     }
 
+    cookies_file = os.getenv("YTDLP_COOKIES_FILE")
+    if cookies_file:
+        ydl_opts["cookiefile"] = cookies_file
+
+    cookies_from_browser = os.getenv("YTDLP_COOKIES_FROM_BROWSER")
+    if cookies_from_browser:
+        browser_spec = cookies_from_browser.strip()
+        if browser_spec.lower() not in ("1", "true", "yes", "on"):
+            ydl_opts["cookiesfrombrowser"] = tuple(part.strip() for part in browser_spec.split(",") if part.strip())
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=True)
         path = ydl.prepare_filename(info)
