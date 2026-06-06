@@ -91,6 +91,19 @@ def _box_from_anchor(
     return x0, y0, x0 + crop_w, y0 + crop_h
 
 
+def _clamp_crop_origin(
+    crop_x: float,
+    crop_y: float,
+    crop_w: int,
+    crop_h: int,
+    src_w: int,
+    src_h: int,
+) -> Tuple[int, int]:
+    final_x = max(0, min(int(crop_x), max(0, src_w - crop_w)))
+    final_y = max(0, min(int(crop_y), max(0, src_h - crop_h)))
+    return final_x, final_y
+
+
 def _box_wh(box: Tuple[float, float, float, float]) -> Tuple[float, float]:
     x0, y0, x1, y1 = box
     return max(1.0, x1 - x0), max(1.0, y1 - y0)
@@ -287,6 +300,8 @@ def get_stable_podcast_crop(
     overlap_lock_until = float(state.get("overlap_lock_until", 0.0) or 0.0)
     pending_track_id = state.get("pending_track_id")
     pending_since = float(state.get("pending_since", -1.0) or -1.0)
+    smooth_crop_x = state.get("smooth_crop_x")
+    smooth_crop_y = state.get("smooth_crop_y")
 
     def lower_face_motion_score(track: Dict) -> float:
         x0, y0, x1, y1 = [int(v) for v in track["bbox"]]
@@ -336,6 +351,12 @@ def get_stable_podcast_crop(
         anchor_y = _smooth_value(float(prev_anchor_y) if prev_anchor_y is not None else None, anchor_y, 0.18)
         state["anchor_y_smoothed"] = anchor_y
         return anchor_x, anchor_y
+
+    def target_crop_origin(track: Dict) -> Tuple[float, float]:
+        anchor_x, anchor_y = torso_anchor(track)
+        target_x = anchor_x - (crop_w / 2.0)
+        target_y = anchor_y - (crop_h / 2.0)
+        return target_x, target_y
 
     def normalize_box(box: Tuple[float, float, float, float]) -> Optional[Tuple[int, int, int, int]]:
         x1, y1, x2, y2 = [int(round(v)) for v in box]
@@ -483,6 +504,24 @@ def get_stable_podcast_crop(
     state["last_box"] = box
     state["pending_track_id"] = None
     state["pending_since"] = -1.0
+
+    # ADAPTIVE SMOOTHING
+    target_crop_x, target_crop_y = target_crop_origin(candidate)
+    current_crop_x = float(smooth_crop_x if smooth_crop_x is not None else target_crop_x)
+    current_crop_y = float(smooth_crop_y if smooth_crop_y is not None else target_crop_y)
+    delta_x = abs(target_crop_x - current_crop_x)
+    delta_y = abs(target_crop_y - current_crop_y)
+    max_delta = max(delta_x, delta_y)
+    dynamic_factor = 0.25 if max_delta > 50 else 0.08
+    current_crop_x += (target_crop_x - current_crop_x) * dynamic_factor
+    current_crop_y += (target_crop_y - current_crop_y) * dynamic_factor
+    final_x, final_y = _clamp_crop_origin(current_crop_x, current_crop_y, crop_w, crop_h, src_w, src_h)
+    state["smooth_crop_x"] = float(current_crop_x)
+    state["smooth_crop_y"] = float(current_crop_y)
+    state["final_crop_x"] = final_x
+    state["final_crop_y"] = final_y
+
+    print(f"[DEBUG] Adaptive smoothing: delta_x={delta_x:.2f}, delta_y={delta_y:.2f}, factor={dynamic_factor:.2f}", flush=True)
     print(f"[DEBUG] Final crop box: {box}", flush=True)
     return box, state
 
@@ -931,11 +970,12 @@ def _reframe_vertical_podcast_impl(
         if box is None:
             x0, y0, x1, y1 = _box_from_center(src_w / 2.0, src_h / 2.0, crop_w, crop_h, src_w, src_h)
         else:
-            # Anchor crop on the torso so head turns do not drag the crop window.
-            x0b, y0b, x1b, y1b = box
-            anchor_x = (x0b + x1b) / 2.0
-            anchor_y = y0b + ((y1b - y0b) * 0.65)
-            x0, y0, x1, y1 = _box_from_anchor(anchor_x, anchor_y, crop_w, crop_h, src_w, src_h)
+            x0 = int(state.get("final_crop_x", 0))
+            y0 = int(state.get("final_crop_y", 0))
+            x0 = max(0, min(x0, max(0, src_w - crop_w)))
+            y0 = max(0, min(y0, max(0, src_h - crop_h)))
+            x1 = x0 + crop_w
+            y1 = y0 + crop_h
 
         cropped = frame[y0:y1, x0:x1]
         if cropped.shape[0] != crop_h or cropped.shape[1] != crop_w:
