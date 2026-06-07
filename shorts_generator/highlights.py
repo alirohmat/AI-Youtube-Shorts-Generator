@@ -103,7 +103,7 @@ def clean_json_response(text: str) -> str:
     # Normalize common LLM time suffixes like `677.1s` into valid JSON numbers.
     # This is intentionally conservative: only strip a trailing `s` when it is
     # attached to a numeric literal and appears before a JSON delimiter.
-    cleaned = re.sub(r'(?<=[:\[,\s])(-?\d+(?:\.\d+)?)s(?=\s*[,}\]])', r'\1', cleaned)
+    cleaned = re.sub(r"(\d+\.?\d*)s\b", r"\1", cleaned)
 
     start = cleaned.find("{")
     end = cleaned.rfind("}")
