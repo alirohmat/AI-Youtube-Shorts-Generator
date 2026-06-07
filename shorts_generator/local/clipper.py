@@ -616,14 +616,12 @@ def _cut_subclip(source_path: str, start: float, end: float, out_path: str) -> s
     return out_path
 
 
-def _open_video_capture(path: str, retries: int = 5, delay_seconds: float = 0.2) -> cv2.VideoCapture:
-    """Open a video capture with a small retry window for freshly written files."""
-    last_capture = None
+def _open_video_capture(path: str, retries: int = 8, delay_seconds: float = 0.25) -> cv2.VideoCapture:
+    """Open a video file with a small retry window for freshly written outputs."""
     for attempt in range(retries):
         cap = cv2.VideoCapture(path)
         if cap.isOpened():
             return cap
-        last_capture = cap
         cap.release()
         if attempt < retries - 1:
             import time
@@ -707,33 +705,9 @@ def _reframe_vertical(
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
     silent_path = out_path + ".silent.mp4"
-    fifo_path = silent_path
     debug_path = os.path.join(os.path.dirname(out_path), "output_debug.mp4") if debug else None
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    use_pipe = False
-    _ffmpeg_cap = None
-    if not debug:
-        try:
-            if os.path.exists(fifo_path):
-                os.remove(fifo_path)
-            os.mkfifo(fifo_path)
-            _reader_cmd = [
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-f", "mp4", "-i", fifo_path,
-                "-i", in_path,
-                "-c:v", "copy",
-                "-c:a", "aac", "-b:a", "128k",
-                "-map", "0:v:0", "-map", "1:a:0?", "-shortest",
-                out_path,
-            ]
-            _ffmpeg_cap = subprocess.Popen(_reader_cmd, stdin=subprocess.DEVNULL)
-            use_pipe = True
-        except (OSError, subprocess.SubprocessError) as exc:
-            print(f"[pipe] init failed ({exc}), flat-file fallback", flush=True)
-            use_pipe = False
-
-    writer_path = fifo_path if use_pipe else silent_path
-    writer = cv2.VideoWriter(writer_path, fourcc, fps, (crop_w, crop_h))
+    writer = cv2.VideoWriter(silent_path, fourcc, fps, (crop_w, crop_h))
     debug_writer = cv2.VideoWriter(debug_path, fourcc, fps, (src_w, src_h)) if debug_path else None
 
     last_center: Optional[Tuple[int, int]] = None
@@ -1040,22 +1014,6 @@ def _reframe_vertical(
         writer.release()
         if debug_writer is not None:
             debug_writer.release()
-        if use_pipe and _ffmpeg_cap is not None:
-            try:
-                _ffmpeg_cap.wait(timeout=120)
-            except subprocess.TimeoutExpired:
-                _ffmpeg_cap.kill()
-                _ffmpeg_cap.wait(timeout=10)
-            _ffmpeg_cap = None
-            if os.path.exists(fifo_path):
-                try:
-                    os.remove(fifo_path)
-                except OSError:
-                    pass
-
-    if use_pipe:
-        return out_path
-
     cmd = [
         "ffmpeg",
         "-y",
@@ -1127,37 +1085,14 @@ def _reframe_vertical_podcast_impl(
     src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     crop_w, crop_h = _crop_size(src_w, src_h, target_ratio)
+    dead_zone_threshold = max(15.0, crop_w * 0.06)
 
     model = YOLO("yolov8n.pt")
 
     silent_path = out_path + ".silent.mp4"
-    fifo_path = silent_path
     debug_path = os.path.join(os.path.dirname(out_path), "output_debug.mp4") if debug else None
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    use_pipe = False
-    _ffmpeg_cap = None
-    if not debug:
-        try:
-            if os.path.exists(fifo_path):
-                os.remove(fifo_path)
-            os.mkfifo(fifo_path)
-            _reader_cmd = [
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-f", "mp4", "-i", fifo_path,
-                "-i", in_path,
-                "-c:v", "copy",
-                "-c:a", "aac", "-b:a", "128k",
-                "-map", "0:v:0", "-map", "1:a:0?", "-shortest",
-                out_path,
-            ]
-            _ffmpeg_cap = subprocess.Popen(_reader_cmd, stdin=subprocess.DEVNULL)
-            use_pipe = True
-        except (OSError, subprocess.SubprocessError) as exc:
-            print(f"[pipe/podcast] init failed ({exc}), flat-file fallback", flush=True)
-            use_pipe = False
-
-    writer_path = fifo_path if use_pipe else silent_path
-    writer = cv2.VideoWriter(writer_path, fourcc, fps, (crop_w, crop_h))
+    writer = cv2.VideoWriter(silent_path, fourcc, fps, (crop_w, crop_h))
     debug_writer = cv2.VideoWriter(debug_path, fourcc, fps, (src_w, src_h)) if debug_path else None
 
     state: Dict = {}
@@ -1187,6 +1122,31 @@ def _reframe_vertical_podcast_impl(
                 cropped = cv2.resize(cropped, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
             writer.write(cropped)
 
+            current_crop_center_x = (x0 + x1) / 2.0
+            current_crop_center_y = (y0 + y1) / 2.0
+            target_anchor_x = float(state.get("final_crop_x", x0) + (crop_w / 2.0))
+            target_anchor_y = float(state.get("final_crop_y", y0) + (crop_h / 2.0))
+            delta_x = target_anchor_x - current_crop_center_x
+            delta_y = target_anchor_y - current_crop_center_y
+
+            if abs(delta_x) <= dead_zone_threshold:
+                next_crop_x = float(x0)
+            else:
+                step_x = delta_x - (dead_zone_threshold if delta_x > 0 else -dead_zone_threshold)
+                next_crop_x = float(x0 + (step_x * 0.22))
+
+            if abs(delta_y) <= dead_zone_threshold:
+                next_crop_y = float(y0)
+            else:
+                step_y = delta_y - (dead_zone_threshold if delta_y > 0 else -dead_zone_threshold)
+                next_crop_y = float(y0 + (step_y * 0.22))
+
+            final_x, final_y = _clamp_crop_origin(next_crop_x, next_crop_y, crop_w, crop_h, src_w, src_h)
+            state["smooth_crop_x"] = float(next_crop_x)
+            state["smooth_crop_y"] = float(next_crop_y)
+            state["final_crop_x"] = final_x
+            state["final_crop_y"] = final_y
+
             if debug and debug_writer is not None:
                 overlay = frame.copy()
                 cv2.rectangle(overlay, (x0, y0), (x1, y1), (0, 255, 0), 3)
@@ -1205,21 +1165,6 @@ def _reframe_vertical_podcast_impl(
         writer.release()
         if debug_writer is not None:
             debug_writer.release()
-        if use_pipe and _ffmpeg_cap is not None:
-            try:
-                _ffmpeg_cap.wait(timeout=120)
-            except subprocess.TimeoutExpired:
-                _ffmpeg_cap.kill()
-                _ffmpeg_cap.wait(timeout=10)
-            _ffmpeg_cap = None
-            if os.path.exists(fifo_path):
-                try:
-                    os.remove(fifo_path)
-                except OSError:
-                    pass
-
-    if use_pipe:
-        return out_path
 
     cmd = [
         "ffmpeg",
