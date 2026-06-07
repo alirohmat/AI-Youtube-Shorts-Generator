@@ -100,6 +100,11 @@ def clean_json_response(text: str) -> str:
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
     cleaned = re.sub(r"\s*```$", "", cleaned)
 
+    # Normalize common LLM time suffixes like `677.1s` into valid JSON numbers.
+    # This is intentionally conservative: only strip a trailing `s` when it is
+    # attached to a numeric literal and appears before a JSON delimiter.
+    cleaned = re.sub(r'(?<=[:\[,\s])(-?\d+(?:\.\d+)?)s(?=\s*[,}\]])', r'\1', cleaned)
+
     start = cleaned.find("{")
     end = cleaned.rfind("}")
     if start != -1 and end != -1 and end > start:
