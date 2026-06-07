@@ -11,10 +11,12 @@ drive either MuAPI (default, --mode api) or a direct local LLM client
 (--mode local).
 """
 import json
+import os
 import re
 from typing import Callable, Dict, List, Optional
 
 from . import muapi
+from .config import TAVILY_API_KEY, USE_TAVILY_CONTEXT
 
 
 LLMFn = Callable[[str], str]
@@ -45,6 +47,8 @@ HIGHLIGHT_SYSTEM_PROMPT = """You are an elite short-form video editor who has st
 
 Content type: {content_type} | Density: {density}
 
+{external_context_block}
+
 Your task: identify the most viral-worthy highlights from the transcript.
 
 Rules:
@@ -65,6 +69,40 @@ CHUNK_SIZE_SECONDS = 1200       # 20-min chunks for long videos
 LONG_VIDEO_THRESHOLD = 1800     # chunk videos longer than 30 min
 CHUNK_OVERLAP_SECONDS = 60
 GPT_CALL_TIMEOUT_SECONDS = 300  # cap LLM polls at 5 min — a wedged call should fail fast
+
+
+def _extract_chunk_topic(transcript_text: str) -> str:
+    sentences = re.split(r"(?<=[.!?])\s+", transcript_text.strip())
+    topic = " ".join(s for s in sentences[:3] if s).strip()
+    return topic[:1000]
+
+
+def _default_external_context_block() -> str:
+    return (
+        "[EXTERNAL CONTEXT: unavailable] "
+        "Gunakan konteks eksternal ini untuk menilai sensitivitas, relevansi, dan potensi viral dari topik tersebut."
+    )
+
+
+def _build_external_context_block(chunk_topic: str) -> str:
+    if not USE_TAVILY_CONTEXT or not TAVILY_API_KEY:
+        return _default_external_context_block()
+
+    try:
+        from tavily import TavilyClient
+
+        tavily_client = TavilyClient(api_key=os.environ.get("TAVILY_API_KEY"))
+        response = tavily_client.search(query=chunk_topic, search_depth="basic", max_results=3)
+        context = " ".join([r.get("content", "") for r in response.get("results", [])][:3]).strip()
+        if not context:
+            context = "unavailable"
+        return (
+            f"[EXTERNAL CONTEXT: {context}] "
+            "Gunakan konteks eksternal ini untuk menilai sensitivitas, relevansi, dan potensi viral dari topik tersebut."
+        )
+    except Exception:
+        print("[WARN] Tavily context failed, proceeding without external context", flush=True)
+        return _default_external_context_block()
 
 
 def call_muapi_llm(prompt: str) -> str:
@@ -178,6 +216,7 @@ def call_highlight_api(
     duration: float,
     num_clips: int,
     is_chunk: bool = False,
+    external_context_block: str = "",
     llm_fn: LLMFn = call_muapi_llm,
 ) -> Dict:
     # Ask for ~2× the user's target so dedupe has headroom, but cap so the model
@@ -190,6 +229,7 @@ def call_highlight_api(
         content_type=content_info.get("content_type", "other"),
         density=content_info.get("density", "medium"),
         num_clips_instruction=f"Generate at least {min_clips} highlights",
+        external_context_block=external_context_block or _default_external_context_block(),
     )
     full_prompt = f"{system}\n\nTranscript:\n{transcript_text}"
     raw = llm_fn(full_prompt)
@@ -244,7 +284,17 @@ def get_highlights(
             offset = chunk.get("_offset", 0)
             text = build_transcript_text(chunk)
             print(f"[highlights] chunk {i + 1}/{len(chunks)} (offset {offset:.0f}s)", flush=True)
-            result = call_highlight_api(text, content_info, chunk["duration"], num_clips=num_clips, is_chunk=True, llm_fn=llm_fn)
+            chunk_topic = _extract_chunk_topic(text)
+            external_context_block = _build_external_context_block(chunk_topic)
+            result = call_highlight_api(
+                text,
+                content_info,
+                chunk["duration"],
+                num_clips=num_clips,
+                is_chunk=True,
+                external_context_block=external_context_block,
+                llm_fn=llm_fn,
+            )
             for h in result.get("highlights", []):
                 h["start_time"] = float(h["start_time"]) + offset
                 h["end_time"] = float(h["end_time"]) + offset
