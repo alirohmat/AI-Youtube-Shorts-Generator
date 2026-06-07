@@ -72,9 +72,24 @@ GPT_CALL_TIMEOUT_SECONDS = 300  # cap LLM polls at 5 min — a wedged call shoul
 
 
 def _extract_chunk_topic(transcript_text: str) -> str:
-    sentences = re.split(r"(?<=[.!?])\s+", transcript_text.strip())
-    topic = " ".join(s for s in sentences[:3] if s).strip()
-    return topic[:1000]
+    text = re.sub(r"\[[0-9]+(?:\.[0-9]+)?s\]\s*", " ", transcript_text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    for sentence in sentences:
+        candidate = sentence.strip()
+        if not candidate:
+            continue
+        candidate = re.sub(r"^\[[^\]]*\]\s*", "", candidate).strip()
+        if not candidate:
+            continue
+        if re.fullmatch(r"[\W_\d]+", candidate):
+            continue
+        return candidate[:1000]
+
+    return text[:1000]
 
 
 def extract_topic_with_llm(chunk_text: str, llm_fn: Callable[[str], str]) -> str:
