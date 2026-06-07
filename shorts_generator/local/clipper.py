@@ -568,24 +568,13 @@ def get_stable_podcast_crop(
     state["pending_track_id"] = None
     state["pending_since"] = -1.0
 
-    # ADAPTIVE SMOOTHING
-    target_crop_x, target_crop_y = target_crop_origin(candidate)
-    current_crop_x = float(smooth_crop_x if smooth_crop_x is not None else target_crop_x)
-    current_crop_y = float(smooth_crop_y if smooth_crop_y is not None else target_crop_y)
-    delta_x = abs(target_crop_x - current_crop_x)
-    delta_y = abs(target_crop_y - current_crop_y)
-    max_delta = max(delta_x, delta_y)
-    dynamic_factor = 0.4 if max_delta > 50 else 0.08
-    current_crop_x += (target_crop_x - current_crop_x) * dynamic_factor
-    current_crop_y += (target_crop_y - current_crop_y) * dynamic_factor
-    final_x, final_y = _clamp_crop_origin(current_crop_x, current_crop_y, crop_w, crop_h, src_w, src_h)
-    state["smooth_crop_x"] = float(current_crop_x)
-    state["smooth_crop_y"] = float(current_crop_y)
+    final_x, final_y = _clamp_crop_origin(box[0], box[1], crop_w, crop_h, src_w, src_h)
+    state["smooth_crop_x"] = float(final_x)
+    state["smooth_crop_y"] = float(final_y)
     state["final_crop_x"] = final_x
     state["final_crop_y"] = final_y
 
     if debug or should_log_debug:
-        print(f"[DEBUG] Adaptive smoothing: delta_x={delta_x:.2f}, delta_y={delta_y:.2f}, factor={dynamic_factor:.2f}", flush=True)
         print(f"[DEBUG] Final crop box: {box}", flush=True)
     return box, state
 
