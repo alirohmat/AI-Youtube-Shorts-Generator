@@ -435,7 +435,9 @@ def get_stable_podcast_crop(
         return score
 
     motion_scores = {int(t["track_id"]): motion_score_person(t) for t in tracks}
-    should_log_debug = debug or last_debug_log_ts < 0.0 or (current_timestamp - last_debug_log_ts) >= 1.0
+    should_log_debug = debug and (
+        last_debug_log_ts < 0.0 or (current_timestamp - last_debug_log_ts) >= 1.0
+    )
     if should_log_debug:
         print(f"[DEBUG] Timestamp: {current_timestamp}s", flush=True)
         print(f"[DEBUG] Active SRT segment: {now_segment}", flush=True)
@@ -573,7 +575,7 @@ def get_stable_podcast_crop(
     delta_x = abs(target_crop_x - current_crop_x)
     delta_y = abs(target_crop_y - current_crop_y)
     max_delta = max(delta_x, delta_y)
-    dynamic_factor = 0.5 if max_delta > 50 else 0.08
+    dynamic_factor = 0.4 if max_delta > 50 else 0.08
     current_crop_x += (target_crop_x - current_crop_x) * dynamic_factor
     current_crop_y += (target_crop_y - current_crop_y) * dynamic_factor
     final_x, final_y = _clamp_crop_origin(current_crop_x, current_crop_y, crop_w, crop_h, src_w, src_h)
