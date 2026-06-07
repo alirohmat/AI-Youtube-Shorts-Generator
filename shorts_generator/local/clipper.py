@@ -142,6 +142,55 @@ def _active_segment(current_timestamp: float, srt_segments: Sequence[Dict]) -> O
     return None
 
 
+def _segments_density(
+    current_timestamp: float,
+    srt_segments: Sequence[Dict],
+    window: float = 10.0,
+) -> int:
+    count = 0
+    for segment in srt_segments:
+        seg_start = float(segment.get("start", 0.0) or 0.0)
+        seg_end = float(segment.get("end", 0.0) or 0.0)
+        if seg_start <= current_timestamp <= seg_end:
+            count += 1
+        elif (current_timestamp - window) <= seg_end <= current_timestamp:
+            count += 1
+        elif current_timestamp <= seg_start <= (current_timestamp + window):
+            count += 1
+    return count
+
+
+def _speaking_rate(
+    current_timestamp: float,
+    srt_segments: Sequence[Dict],
+    window: float = 10.0,
+) -> float:
+    count = _segments_density(current_timestamp, srt_segments, window)
+    rate = count / max(window, 1e-6)
+    return max(0.0, min(rate, 5.0))
+
+
+def _dynamic_overlap_lock_seconds(
+    current_timestamp: float,
+    srt_segments: Sequence[Dict],
+    min_lock: float = 1.5,
+    max_lock: float = 4.0,
+    window: float = 10.0,
+) -> float:
+    rate = _speaking_rate(current_timestamp, srt_segments, window)
+    fast_threshold = 2.0
+    medium_threshold = 1.0
+    if rate >= fast_threshold:
+        lock = min_lock
+    elif rate >= medium_threshold:
+        fraction = (rate - medium_threshold) / (fast_threshold - medium_threshold)
+        lock = min_lock + fraction * (2.5 - min_lock)
+    else:
+        fraction = rate / medium_threshold
+        lock = 2.5 + fraction * (max_lock - 2.5)
+    return max(min_lock, min(lock, max_lock))
+
+
 def _active_segments(current_timestamp: float, srt_segments: Sequence[Dict]) -> List[Dict]:
     active: List[Dict] = []
     for segment in srt_segments:
@@ -395,9 +444,12 @@ def get_stable_podcast_crop(
     overlap_detected = len(active_segments) > 1
     if overlap_detected:
         print(f"[OVERLAP] {len(active_segments)} speakers active. Locked ID: {locked_id}", flush=True)
-        if overlap_lock_until <= current_timestamp:
-            overlap_lock_until = current_timestamp + 3.0
-        state["overlap_lock_until"] = overlap_lock_until
+    if overlap_lock_until <= current_timestamp:
+        lock_seconds = _dynamic_overlap_lock_seconds(current_timestamp, srt_segments or [])
+        log_note = "fast" if lock_seconds <= 1.6 else "medium" if lock_seconds <= 2.5 else "slow"
+        print(f"[OVERLAP] dynamic lock = {lock_seconds:.1f}s ({log_note})", flush=True)
+        overlap_lock_until = current_timestamp + lock_seconds
+    state["overlap_lock_until"] = overlap_lock_until
 
     track_by_id = {int(t["track_id"]): t for t in tracks}
 
@@ -631,15 +683,46 @@ def _reframe_vertical(
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
     silent_path = out_path + ".silent.mp4"
+    fifo_path = silent_path
     debug_path = os.path.join(os.path.dirname(out_path), "output_debug.mp4") if debug else None
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(silent_path, fourcc, fps, (crop_w, crop_h))
+    use_pipe = False
+    _ffmpeg_cap = None
+    if not debug:
+        try:
+            if os.path.exists(fifo_path):
+                os.remove(fifo_path)
+            os.mkfifo(fifo_path)
+            _reader_cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "mp4", "-i", fifo_path,
+                "-i", in_path,
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "128k",
+                "-map", "0:v:0", "-map", "1:a:0?", "-shortest",
+                out_path,
+            ]
+            _ffmpeg_cap = subprocess.Popen(_reader_cmd, stdin=subprocess.DEVNULL)
+            use_pipe = True
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"[pipe] init failed ({exc}), flat-file fallback", flush=True)
+            use_pipe = False
+
+    writer_path = fifo_path if use_pipe else silent_path
+    writer = cv2.VideoWriter(writer_path, fourcc, fps, (crop_w, crop_h))
     debug_writer = cv2.VideoWriter(debug_path, fourcc, fps, (src_w, src_h)) if debug_path else None
 
     last_center: Optional[Tuple[int, int]] = None
     smoothing = 0.18
 
+    locked_face_id: Optional[int] = None
+    lock_streak: int = 0
+    locked_score: float = 0.0
+    SUBJECT_HYSTERESIS = 0.15
+    SUBJECT_LOCK_FRAMES = 14
+
     def _best_subject(frame, face_data, pose_data, audio_energy_arr, frame_index: int) -> Dict:
+        nonlocal locked_face_id, lock_streak, locked_score
         frame_h, frame_w = frame.shape[:2]
         energy = 0.0
         if audio_energy_arr is not None:
@@ -657,6 +740,7 @@ def _reframe_vertical(
 
         best_candidate: Optional[Dict] = None
         best_score = -1.0
+        locked_candidate: Optional[Dict] = None
         for face in face_data or []:
             face_center = face.get("face_center")
             if not face_center:
@@ -678,15 +762,24 @@ def _reframe_vertical(
 
             face_size_score = min(face_area / float(frame_w * frame_h), 0.18) / 0.18
 
+            reaction_score = float(face.get("reaction_score", 0.0) or 0.0)
+            reaction_bonus = 1.0 + (0.40 * reaction_score)
+
             if audio_high:
-                activity_score = (0.70 * mouth_motion_score) + (0.30 * face_center_score)
+                activity = (0.70 * mouth_motion_score) + (0.30 * face_center_score) + (0.15 * reaction_score)
             else:
-                activity_score = (0.50 * pose_stability) + (0.30 * face_center_score) + (0.20 * pose_alignment_score)
+                silent_activity = (0.50 * pose_stability) + (0.30 * face_center_score) + (0.20 * pose_alignment_score)
+                reaction_component = max(silent_activity, 0.58 * reaction_score)
+                activity = reaction_component + (0.10 * reaction_score)
 
             base_score = (0.25 * face_center_score) + (0.20 * face_size_score) + (0.20 * pose_alignment_score)
-            score = base_score + activity_score
 
-            candidate = {
+            if audio_high:
+                score = (base_score + activity) * reaction_bonus
+            else:
+                score = base_score + activity
+
+            candidate: Dict = {
                 "face_id": face.get("face_id"),
                 "face_center": face_center,
                 "face_area": face_area,
@@ -702,10 +795,15 @@ def _reframe_vertical(
             if score > best_score:
                 best_score = score
                 best_candidate = candidate
+            if locked_face_id is not None and face.get("face_id") == locked_face_id:
+                locked_candidate = candidate
 
         if best_candidate is None:
+            locked_face_id = None
+            lock_streak = 0
+            locked_score = 0.0
             fallback_center = pose_center if pose_center is not None else (frame_w // 2, frame_h // 2)
-            best_candidate = {
+            return {
                 "face_id": None,
                 "face_center": fallback_center,
                 "face_area": 1,
@@ -718,6 +816,33 @@ def _reframe_vertical(
                 "score": 0.0,
             }
 
+        best_id = best_candidate["face_id"]
+        best_score_val = best_score
+
+        if locked_face_id is None:
+            locked_face_id = best_id
+            locked_score = best_score_val
+            lock_streak = SUBJECT_LOCK_FRAMES
+        elif best_id == locked_face_id:
+            lock_streak = min(lock_streak + 1, SUBJECT_LOCK_FRAMES + 5)
+            locked_score = locked_score * 0.85 + best_score_val * 0.15
+        elif locked_candidate is not None:
+            lock_streak = max(lock_streak - 1, 0)
+            if best_score_val > locked_score * (1.0 + SUBJECT_HYSTERESIS):
+                lock_streak = max(lock_streak - 1, 0)
+            if lock_streak <= 0:
+                locked_face_id = best_id
+                locked_score = best_score_val
+                lock_streak = SUBJECT_LOCK_FRAMES
+                best_candidate["face_id"] = best_id
+                return best_candidate
+            return locked_candidate
+        else:
+            locked_face_id = best_id
+            locked_score = best_score_val
+            lock_streak = SUBJECT_LOCK_FRAMES
+
+        best_candidate["face_id"] = best_id
         return best_candidate
 
     try:
@@ -785,12 +910,29 @@ def _reframe_vertical(
                         top = face_landmarks.landmark[13]
                         bottom = face_landmarks.landmark[14]
                         mouth_variance = float(hypot(top.x - bottom.x, top.y - bottom.y))
+                        lm = face_landmarks.landmark
+                        left_eye_open = hypot(
+                            lm[159].x - lm[145].x, lm[159].y - lm[145].y
+                        )
+                        right_eye_open = hypot(
+                            lm[386].x - lm[374].x, lm[386].y - lm[374].y
+                        )
+                        eye_openness = (left_eye_open + right_eye_open) / 2.0
+                        mouth_width = hypot(
+                            lm[61].x - lm[291].x, lm[61].y - lm[291].y
+                        )
+                        reaction_score = max(
+                            min(eye_openness / 0.04, 1.0),
+                            min(mouth_variance / 0.06, 1.0),
+                            min(mouth_width / 0.18, 1.0),
+                        )
                         face_data.append(
                             {
                                 "face_id": idx,
                                 "face_center": face_center,
                                 "face_area": face_area,
                                 "mouth_openness_variance": mouth_variance,
+                                "reaction_score": reaction_score,
                             }
                         )
                 pose_data = None
@@ -874,6 +1016,21 @@ def _reframe_vertical(
         writer.release()
         if debug_writer is not None:
             debug_writer.release()
+        if use_pipe and _ffmpeg_cap is not None:
+            try:
+                _ffmpeg_cap.wait(timeout=120)
+            except subprocess.TimeoutExpired:
+                _ffmpeg_cap.kill()
+                _ffmpeg_cap.wait(timeout=10)
+            _ffmpeg_cap = None
+            if os.path.exists(fifo_path):
+                try:
+                    os.remove(fifo_path)
+                except OSError:
+                    pass
+
+    if use_pipe:
+        return out_path
 
     cmd = [
         "ffmpeg",
@@ -898,7 +1055,8 @@ def _reframe_vertical(
         out_path,
     ]
     subprocess.run(cmd, check=True)
-    os.remove(silent_path)
+    if os.path.exists(silent_path):
+        os.remove(silent_path)
     return out_path
 
 
@@ -951,55 +1109,95 @@ def _reframe_vertical_podcast_impl(
     model = YOLO("yolov8n.pt")
 
     silent_path = out_path + ".silent.mp4"
+    fifo_path = silent_path
     debug_path = os.path.join(os.path.dirname(out_path), "output_debug.mp4") if debug else None
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(silent_path, fourcc, fps, (crop_w, crop_h))
+    use_pipe = False
+    _ffmpeg_cap = None
+    if not debug:
+        try:
+            if os.path.exists(fifo_path):
+                os.remove(fifo_path)
+            os.mkfifo(fifo_path)
+            _reader_cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "mp4", "-i", fifo_path,
+                "-i", in_path,
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "128k",
+                "-map", "0:v:0", "-map", "1:a:0?", "-shortest",
+                out_path,
+            ]
+            _ffmpeg_cap = subprocess.Popen(_reader_cmd, stdin=subprocess.DEVNULL)
+            use_pipe = True
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"[pipe/podcast] init failed ({exc}), flat-file fallback", flush=True)
+            use_pipe = False
+
+    writer_path = fifo_path if use_pipe else silent_path
+    writer = cv2.VideoWriter(writer_path, fourcc, fps, (crop_w, crop_h))
     debug_writer = cv2.VideoWriter(debug_path, fourcc, fps, (src_w, src_h)) if debug_path else None
 
     state: Dict = {}
     prev_gray: Optional[np.ndarray] = None
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        current_timestamp = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0) / 1000.0
-        box, state = get_stable_podcast_crop(frame, current_timestamp, srt_segments or [], {**state, "prev_gray": prev_gray})
-        prev_gray = state.get("prev_gray")
+            current_timestamp = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0) / 1000.0
+            box, state = get_stable_podcast_crop(frame, current_timestamp, srt_segments or [], {**state, "prev_gray": prev_gray})
+            prev_gray = state.get("prev_gray")
 
-        if box is None:
-            x0, y0, x1, y1 = _box_from_center(src_w / 2.0, src_h / 2.0, crop_w, crop_h, src_w, src_h)
-        else:
-            x0 = int(state.get("final_crop_x", 0))
-            y0 = int(state.get("final_crop_y", 0))
-            x0 = max(0, min(x0, max(0, src_w - crop_w)))
-            y0 = max(0, min(y0, max(0, src_h - crop_h)))
-            x1 = x0 + crop_w
-            y1 = y0 + crop_h
+            if box is None:
+                x0, y0, x1, y1 = _box_from_center(src_w / 2.0, src_h / 2.0, crop_w, crop_h, src_w, src_h)
+            else:
+                x0 = int(state.get("final_crop_x", 0))
+                y0 = int(state.get("final_crop_y", 0))
+                x0 = max(0, min(x0, max(0, src_w - crop_w)))
+                y0 = max(0, min(y0, max(0, src_h - crop_h)))
+                x1 = x0 + crop_w
+                y1 = y0 + crop_h
 
-        cropped = frame[y0:y1, x0:x1]
-        if cropped.shape[0] != crop_h or cropped.shape[1] != crop_w:
-            cropped = cv2.resize(cropped, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
-        writer.write(cropped)
+            cropped = frame[y0:y1, x0:x1]
+            if cropped.shape[0] != crop_h or cropped.shape[1] != crop_w:
+                cropped = cv2.resize(cropped, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
+            writer.write(cropped)
 
-        if debug and debug_writer is not None:
-            overlay = frame.copy()
-            cv2.rectangle(overlay, (x0, y0), (x1, y1), (0, 255, 0), 3)
-            cv2.putText(
-                overlay,
-                f"PODCAST ID: {state.get('locked_id', 'n/a')}",
-                (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 0),
-                2,
-            )
-            debug_writer.write(overlay)
+            if debug and debug_writer is not None:
+                overlay = frame.copy()
+                cv2.rectangle(overlay, (x0, y0), (x1, y1), (0, 255, 0), 3)
+                cv2.putText(
+                    overlay,
+                    f"PODCAST ID: {state.get('locked_id', 'n/a')}",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 255, 0),
+                    2,
+                )
+                debug_writer.write(overlay)
+    finally:
+        cap.release()
+        writer.release()
+        if debug_writer is not None:
+            debug_writer.release()
+        if use_pipe and _ffmpeg_cap is not None:
+            try:
+                _ffmpeg_cap.wait(timeout=120)
+            except subprocess.TimeoutExpired:
+                _ffmpeg_cap.kill()
+                _ffmpeg_cap.wait(timeout=10)
+            _ffmpeg_cap = None
+            if os.path.exists(fifo_path):
+                try:
+                    os.remove(fifo_path)
+                except OSError:
+                    pass
 
-    cap.release()
-    writer.release()
-    if debug_writer is not None:
-        debug_writer.release()
+    if use_pipe:
+        return out_path
 
     cmd = [
         "ffmpeg",
@@ -1024,7 +1222,8 @@ def _reframe_vertical_podcast_impl(
         out_path,
     ]
     subprocess.run(cmd, check=True)
-    os.remove(silent_path)
+    if os.path.exists(silent_path):
+        os.remove(silent_path)
     return out_path
 
 
