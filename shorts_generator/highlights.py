@@ -77,6 +77,19 @@ def _extract_chunk_topic(transcript_text: str) -> str:
     return topic[:1000]
 
 
+def extract_topic_with_llm(chunk_text: str, llm_fn: Callable[[str], str]) -> str:
+    prompt = (
+        "Rangkum topik utama dari transcript berikut dalam 1 kalimat singkat "
+        "(fokus pada subjek dan isu utama, maksimal 10 kata, bahasa Indonesia):\n\n"
+        f"{chunk_text}"
+    )
+    raw = llm_fn(prompt)
+    cleaned = clean_json_response(raw).strip()
+    cleaned = cleaned.strip('"').strip("'")
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned).strip()
+    return cleaned
+
+
 def _default_external_context_block() -> str:
     return (
         "[EXTERNAL CONTEXT: unavailable] "
@@ -284,7 +297,12 @@ def get_highlights(
             offset = chunk.get("_offset", 0)
             text = build_transcript_text(chunk)
             print(f"[highlights] chunk {i + 1}/{len(chunks)} (offset {offset:.0f}s)", flush=True)
-            chunk_topic = _extract_chunk_topic(text)
+            try:
+                chunk_topic = extract_topic_with_llm(text, llm_fn)
+                print(f"[TAVILY] Extracted topic for search: {chunk_topic}", flush=True)
+            except Exception as e:
+                print(f"[WARN] LLM topic extraction failed: {e}. Fallback to first sentences.", flush=True)
+                chunk_topic = _extract_chunk_topic(text)
             external_context_block = _build_external_context_block(chunk_topic)
             result = call_highlight_api(
                 text,
