@@ -311,6 +311,7 @@ def get_stable_podcast_crop(
     current_timestamp: float,
     srt_segments: Sequence[Dict],
     prev_state: Optional[Dict],
+    debug: bool = False,
 ) -> Tuple[Optional[Tuple[int, int, int, int]], Dict]:
     """Return a stable crop box and next state for podcast videos.
 
@@ -351,6 +352,7 @@ def get_stable_podcast_crop(
     pending_since = float(state.get("pending_since", -1.0) or -1.0)
     smooth_crop_x = state.get("smooth_crop_x")
     smooth_crop_y = state.get("smooth_crop_y")
+    last_debug_log_ts = float(state.get("last_debug_log_ts", -1.0) or -1.0)
 
     def lower_face_motion_score(track: Dict) -> float:
         x0, y0, x1, y1 = [int(v) for v in track["bbox"]]
@@ -433,12 +435,15 @@ def get_stable_podcast_crop(
         return score
 
     motion_scores = {int(t["track_id"]): motion_score_person(t) for t in tracks}
-    print(f"[DEBUG] Timestamp: {current_timestamp}s", flush=True)
-    print(f"[DEBUG] Active SRT segment: {now_segment}", flush=True)
-    print(f"[DEBUG] Tracked persons: {[int(t['track_id']) for t in tracks]}", flush=True)
-    print(f"[DEBUG] Locked ID: {locked_id}", flush=True)
-    print(f"[DEBUG] Motion score person 1: {motion_scores.get(1, 0.0)}", flush=True)
-    print(f"[DEBUG] Motion score person 2: {motion_scores.get(2, 0.0)}", flush=True)
+    should_log_debug = debug or last_debug_log_ts < 0.0 or (current_timestamp - last_debug_log_ts) >= 1.0
+    if should_log_debug:
+        print(f"[DEBUG] Timestamp: {current_timestamp}s", flush=True)
+        print(f"[DEBUG] Active SRT segment: {now_segment}", flush=True)
+        print(f"[DEBUG] Tracked persons: {[int(t['track_id']) for t in tracks]}", flush=True)
+        print(f"[DEBUG] Locked ID: {locked_id}", flush=True)
+        print(f"[DEBUG] Motion score person 1: {motion_scores.get(1, 0.0)}", flush=True)
+        print(f"[DEBUG] Motion score person 2: {motion_scores.get(2, 0.0)}", flush=True)
+        state["last_debug_log_ts"] = current_timestamp
 
     active_segments = _active_segments(current_timestamp, srt_segments)
     overlap_detected = len(active_segments) > 1
@@ -478,7 +483,8 @@ def get_stable_podcast_crop(
             return None, state
         state["last_box"] = box
         state["locked_ts"] = current_timestamp
-        print(f"[DEBUG] Final crop box: {box}", flush=True)
+        if debug or should_log_debug:
+            print(f"[DEBUG] Final crop box: {box}", flush=True)
         return state["last_box"], state
 
     if overlap_detected and locked_id is not None and locked_id in track_by_id and current_timestamp < overlap_lock_until:
@@ -491,7 +497,8 @@ def get_stable_podcast_crop(
         state["locked_ts"] = current_timestamp
         state["pending_track_id"] = None
         state["pending_since"] = -1.0
-        print(f"[DEBUG] Final crop box: {box}", flush=True)
+        if debug or should_log_debug:
+            print(f"[DEBUG] Final crop box: {box}", flush=True)
         return state["last_box"], state
 
     if locked_id is not None and locked_box is not None and last_seen_ts >= 0.0:
@@ -531,14 +538,16 @@ def get_stable_podcast_crop(
                 preserved = normalize_box(tuple(track_by_id[locked_id]["bbox"]))
                 if preserved is not None:
                     state["last_box"] = preserved
-                    print(f"[DEBUG] Final crop box: {preserved}", flush=True)
+                    if debug or should_log_debug:
+                        print(f"[DEBUG] Final crop box: {preserved}", flush=True)
                     return preserved, state
         elif pending_since >= 0.0 and (current_timestamp - pending_since) < 1.5:
             if locked_id in track_by_id:
                 preserved = normalize_box(tuple(track_by_id[locked_id]["bbox"]))
                 if preserved is not None:
                     state["last_box"] = preserved
-                    print(f"[DEBUG] Final crop box: {preserved}", flush=True)
+                    if debug or should_log_debug:
+                        print(f"[DEBUG] Final crop box: {preserved}", flush=True)
                     return preserved, state
         else:
             state["pending_track_id"] = None
@@ -573,8 +582,9 @@ def get_stable_podcast_crop(
     state["final_crop_x"] = final_x
     state["final_crop_y"] = final_y
 
-    print(f"[DEBUG] Adaptive smoothing: delta_x={delta_x:.2f}, delta_y={delta_y:.2f}, factor={dynamic_factor:.2f}", flush=True)
-    print(f"[DEBUG] Final crop box: {box}", flush=True)
+    if debug or should_log_debug:
+        print(f"[DEBUG] Adaptive smoothing: delta_x={delta_x:.2f}, delta_y={delta_y:.2f}, factor={dynamic_factor:.2f}", flush=True)
+        print(f"[DEBUG] Final crop box: {box}", flush=True)
     return box, state
 
 
@@ -604,6 +614,22 @@ def _cut_subclip(source_path: str, start: float, end: float, out_path: str) -> s
     ]
     subprocess.run(cmd, check=True)
     return out_path
+
+
+def _open_video_capture(path: str, retries: int = 5, delay_seconds: float = 0.2) -> cv2.VideoCapture:
+    """Open a video capture with a small retry window for freshly written files."""
+    last_capture = None
+    for attempt in range(retries):
+        cap = cv2.VideoCapture(path)
+        if cap.isOpened():
+            return cap
+        last_capture = cap
+        cap.release()
+        if attempt < retries - 1:
+            import time
+
+            time.sleep(delay_seconds)
+    raise RuntimeError(f"could not open {path}")
 
 
 def extract_audio_energy_array(video_path: str, fps: float) -> List[float]:
@@ -670,9 +696,7 @@ def _reframe_vertical(
     This is intentionally left as the safe fallback path.
     """
     target_ratio = _ratio(aspect_ratio)
-    cap = cv2.VideoCapture(in_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"could not open {in_path}")
+    cap = _open_video_capture(in_path)
 
     src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -1097,9 +1121,7 @@ def _reframe_vertical_podcast_impl(
         raise RuntimeError(f"ultralytics import failed: {e}") from e
 
     target_ratio = _ratio(aspect_ratio)
-    cap = cv2.VideoCapture(in_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"could not open {in_path}")
+    cap = _open_video_capture(in_path)
 
     src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -1147,7 +1169,7 @@ def _reframe_vertical_podcast_impl(
                 break
 
             current_timestamp = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0) / 1000.0
-            box, state = get_stable_podcast_crop(frame, current_timestamp, srt_segments or [], {**state, "prev_gray": prev_gray})
+            box, state = get_stable_podcast_crop(frame, current_timestamp, srt_segments or [], {**state, "prev_gray": prev_gray}, debug=debug)
             prev_gray = state.get("prev_gray")
 
             if box is None:
