@@ -14,6 +14,33 @@ from .highlights import call_muapi_llm, get_highlights
 from .transcriber import transcribe
 
 
+def _sanitize_highlight_timestamps(highlight: Dict, duration: float) -> Optional[Dict]:
+    start_time = float(highlight.get("start_time", 0.0))
+    end_time = float(highlight.get("end_time", 0.0))
+    if duration > 0:
+        start_time = max(0.0, min(start_time, duration))
+        end_time = max(0.0, min(end_time, duration))
+    sanitized = {**highlight, "start_time": start_time, "end_time": end_time}
+    if start_time >= end_time:
+        title = highlight.get("title", "(untitled)")
+        print(
+            f"[pipeline] skipping invalid clip {title!r}: "
+            f"start={start_time:.1f}s end={end_time:.1f}s duration={duration:.1f}s",
+            flush=True,
+        )
+        return None
+    return sanitized
+
+
+def _sanitize_highlights(highlights: List[Dict], duration: float) -> List[Dict]:
+    sanitized: List[Dict] = []
+    for highlight in highlights:
+        item = _sanitize_highlight_timestamps(highlight, duration)
+        if item is not None:
+            sanitized.append(item)
+    return sanitized
+
+
 def _run_local(
     youtube_url: str,
     num_clips: int,
@@ -49,6 +76,7 @@ def _run_local(
         raise RuntimeError("Highlight generator returned zero clips.")
 
     top = sorted(all_highlights, key=lambda h: int(h.get("score", 0)), reverse=True)[:num_clips]
+    top = _sanitize_highlights(top, float(transcript.get("duration", 0.0)))
     print(f"[pipeline/local] cropping {len(top)} of {len(all_highlights)} candidates", flush=True)
 
     shorts = crop_highlights_local(
@@ -90,6 +118,7 @@ def _run_api(
         raise RuntimeError("Highlight generator returned zero clips.")
 
     top = sorted(all_highlights, key=lambda h: int(h.get("score", 0)), reverse=True)[:num_clips]
+    top = _sanitize_highlights(top, float(transcript.get("duration", 0.0)))
     print(f"[pipeline] cropping {len(top)} of {len(all_highlights)} candidates", flush=True)
 
     shorts = crop_highlights(source_url, top, aspect_ratio=aspect_ratio)
