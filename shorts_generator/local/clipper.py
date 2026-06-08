@@ -503,11 +503,6 @@ def get_stable_podcast_crop(
             print(f"[DEBUG] Final crop box: {box}", flush=True)
         return state["last_box"], state
 
-    if locked_id is not None and locked_box is not None and last_seen_ts >= 0.0:
-        if current_timestamp - last_seen_ts < (45.0 / 30.0):
-            state["last_box"] = tuple(int(v) for v in locked_box)
-            return state["last_box"], state
-
     candidate: Optional[Dict] = None
     if overlap_detected:
         candidate = pick_overlap_candidate()
@@ -532,29 +527,6 @@ def get_stable_podcast_crop(
         return None, state
 
     candidate_id = int(candidate["track_id"])
-    if overlap_detected and locked_id is not None and candidate_id != int(locked_id):
-        if pending_track_id != candidate_id:
-            state["pending_track_id"] = candidate_id
-            state["pending_since"] = current_timestamp
-            if locked_id in track_by_id:
-                preserved = normalize_box(tuple(track_by_id[locked_id]["bbox"]))
-                if preserved is not None:
-                    state["last_box"] = preserved
-                    if debug or should_log_debug:
-                        print(f"[DEBUG] Final crop box: {preserved}", flush=True)
-                    return preserved, state
-        elif pending_since >= 0.0 and (current_timestamp - pending_since) < 1.5:
-            if locked_id in track_by_id:
-                preserved = normalize_box(tuple(track_by_id[locked_id]["bbox"]))
-                if preserved is not None:
-                    state["last_box"] = preserved
-                    if debug or should_log_debug:
-                        print(f"[DEBUG] Final crop box: {preserved}", flush=True)
-                    return preserved, state
-        else:
-            state["pending_track_id"] = None
-            state["pending_since"] = -1.0
-
     box = normalize_box(tuple(candidate["bbox"]))
     if box is None:
         return None, state
@@ -1123,14 +1095,12 @@ def _reframe_vertical_podcast_impl(
             if abs(delta_x) <= dead_zone_threshold:
                 next_crop_x = float(x0)
             else:
-                step_x = delta_x - (dead_zone_threshold if delta_x > 0 else -dead_zone_threshold)
-                next_crop_x = float(x0 + (step_x * 0.22))
+                next_crop_x = float(x0 + (delta_x * 0.45))
 
             if abs(delta_y) <= dead_zone_threshold:
                 next_crop_y = float(y0)
             else:
-                step_y = delta_y - (dead_zone_threshold if delta_y > 0 else -dead_zone_threshold)
-                next_crop_y = float(y0 + (step_y * 0.22))
+                next_crop_y = float(y0 + (delta_y * 0.45))
 
             final_x, final_y = _clamp_crop_origin(next_crop_x, next_crop_y, crop_w, crop_h, src_w, src_h)
             state["smooth_crop_x"] = float(next_crop_x)
