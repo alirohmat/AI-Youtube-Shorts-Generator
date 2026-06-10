@@ -324,6 +324,36 @@ def dedupe_highlights(highlights: List[Dict]) -> List[Dict]:
     return kept
 
 
+def _normalize_highlight_bounds(highlight: Dict, duration: float) -> Optional[Dict]:
+    """Clamp and repair highlight timestamps before the pipeline filters them.
+
+    This prevents bad LLM output like zero-length clips or clips that extend
+    past the transcript duration from poisoning the final crop stage.
+    """
+    try:
+        start_time = float(highlight.get("start_time", 0.0))
+        end_time = float(highlight.get("end_time", 0.0))
+    except (TypeError, ValueError):
+        return None
+
+    if duration > 0:
+        start_time = max(0.0, min(start_time, duration))
+        end_time = max(0.0, min(end_time, duration))
+
+    if end_time <= start_time:
+        # Repair obviously broken ranges by expanding to a reasonable default.
+        repaired_start = max(0.0, min(start_time, max(duration - 30.0, 0.0)))
+        repaired_end = repaired_start + 30.0
+        if duration > 0:
+            repaired_end = min(repaired_end, duration)
+        start_time, end_time = repaired_start, repaired_end
+
+    if end_time <= start_time:
+        return None
+
+    return {**highlight, "start_time": start_time, "end_time": end_time}
+
+
 def get_highlights(
     transcript: Dict,
     num_clips: int = 3,
@@ -378,7 +408,9 @@ def get_highlights(
             for h in result.get("highlights", []):
                 h["start_time"] = float(h["start_time"]) + offset
                 h["end_time"] = float(h["end_time"]) + offset
-                all_highlights.append(h)
+                normalized = _normalize_highlight_bounds(h, duration)
+                if normalized is not None:
+                    all_highlights.append(normalized)
         highlights = dedupe_highlights(all_highlights)
     else:
         external_context_block = _build_theme_locked_external_context_block(video_topic, video_topic)
@@ -390,6 +422,14 @@ def get_highlights(
             external_context_block=external_context_block,
             llm_fn=llm_fn,
         )
-        highlights = dedupe_highlights(result.get("highlights", []))
+        normalized_highlights = [
+            item
+            for item in (
+                _normalize_highlight_bounds(h, duration)
+                for h in result.get("highlights", [])
+            )
+            if item is not None
+        ]
+        highlights = dedupe_highlights(normalized_highlights)
 
     return {"highlights": highlights}
