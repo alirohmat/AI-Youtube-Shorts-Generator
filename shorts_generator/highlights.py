@@ -133,6 +133,41 @@ def _build_external_context_block(chunk_topic: str) -> str:
         return _default_external_context_block()
 
 
+def _build_theme_locked_external_context_block(video_topic: str, chunk_topic: str) -> str:
+    """Keep Tavily context anchored to a single video theme.
+
+    We use the video-level topic as the primary search anchor so long-video
+    chunks do not drift into unrelated subtopics. The chunk topic is only used
+    as a light refinement hint in the prompt, not as the search target.
+    """
+    if not USE_TAVILY_CONTEXT or not TAVILY_API_KEY:
+        return _default_external_context_block()
+
+    combined_query = video_topic.strip()
+    if chunk_topic.strip() and chunk_topic.strip().lower() != video_topic.strip().lower():
+        combined_query = f"{video_topic}. Context tambahan dari bagian ini: {chunk_topic}"
+
+    try:
+        from tavily import TavilyClient
+
+        tavily_client = TavilyClient(api_key=os.environ.get("TAVILY_API_KEY"))
+        response = tavily_client.search(query=combined_query, search_depth="basic", max_results=3)
+        contexts = []
+        for result in response.get("results", [])[:3]:
+            content = str(result.get("content", "")).strip()
+            if content:
+                contexts.append(content)
+        context = " ".join(contexts).strip() or "unavailable"
+        return (
+            f"[VIDEO THEME: {video_topic}] [EXTERNAL CONTEXT: {context}] "
+            "Gunakan konteks eksternal ini untuk menilai sensitivitas, relevansi, dan potensi viral, "
+            "tetapi tetap pertahankan tema utama video dan jangan lompat ke topik yang tidak sejalan."
+        )
+    except Exception:
+        print("[WARN] Tavily context failed, proceeding without external context", flush=True)
+        return _default_external_context_block()
+
+
 def call_muapi_llm(prompt: str) -> str:
     """Default LLM backend: MuAPI gpt-5-mini."""
     result = muapi.run(
@@ -304,6 +339,18 @@ def get_highlights(
     content_info = detect_content_type(transcript, llm_fn=llm_fn)
     print(f"[highlights] content={content_info.get('content_type')} density={content_info.get('density')} duration={duration:.0f}s", flush=True)
 
+    transcript_text = build_transcript_text(transcript)
+    video_topic = _extract_chunk_topic(transcript_text)
+    if not video_topic:
+        try:
+            video_topic = extract_topic_with_llm(transcript_text[:4000], llm_fn)
+        except Exception:
+            video_topic = ""
+    if video_topic:
+        print(f"[highlights] video topic anchor: {video_topic}", flush=True)
+    else:
+        video_topic = _extract_chunk_topic(transcript_text)
+
     if duration >= LONG_VIDEO_THRESHOLD:
         chunks = chunk_transcript(transcript)
         print(f"[highlights] long video — splitting into {len(chunks)} chunks", flush=True)
@@ -318,7 +365,7 @@ def get_highlights(
             except Exception as e:
                 print(f"[WARN] LLM topic extraction failed: {e}. Fallback to first sentences.", flush=True)
                 chunk_topic = _extract_chunk_topic(text)
-            external_context_block = _build_external_context_block(chunk_topic)
+            external_context_block = _build_theme_locked_external_context_block(video_topic, chunk_topic)
             result = call_highlight_api(
                 text,
                 content_info,
@@ -334,8 +381,15 @@ def get_highlights(
                 all_highlights.append(h)
         highlights = dedupe_highlights(all_highlights)
     else:
-        text = build_transcript_text(transcript)
-        result = call_highlight_api(text, content_info, duration, num_clips=num_clips, llm_fn=llm_fn)
+        external_context_block = _build_theme_locked_external_context_block(video_topic, video_topic)
+        result = call_highlight_api(
+            transcript_text,
+            content_info,
+            duration,
+            num_clips=num_clips,
+            external_context_block=external_context_block,
+            llm_fn=llm_fn,
+        )
         highlights = dedupe_highlights(result.get("highlights", []))
 
     return {"highlights": highlights}
