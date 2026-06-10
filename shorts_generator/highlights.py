@@ -54,6 +54,8 @@ Your task: identify the most viral-worthy highlights from the transcript.
 Rules:
 - Every highlight must open with a strong HOOK — a line that grabs attention within the first 3 seconds
 - Duration sweet spot: 45-90 seconds. Go shorter (20-44s) only for a perfect standalone one-liner. Go longer (91-180s) only when a story arc needs full context to land
+- Do not place highlight start_time or end_time in the last 15 seconds of a chunk unless the clip has a clear payoff that cannot be moved earlier
+- Prefer clips that have at least 20 seconds of breathing room before the chunk ends
 - Never cut mid-sentence or mid-thought — each clip must feel complete and self-contained
 - Clips must not overlap significantly with each other
 - Score 0-100 on viral potential (not general quality)
@@ -340,15 +342,22 @@ def _normalize_highlight_bounds(highlight: Dict, duration: float) -> Optional[Di
         start_time = max(0.0, min(start_time, duration))
         end_time = max(0.0, min(end_time, duration))
 
-    if end_time <= start_time:
+        tail_guard = 15.0
+        if end_time >= duration:
+            end_time = max(0.0, duration - tail_guard)
+        if start_time >= duration:
+            start_time = max(0.0, duration - max(30.0, tail_guard))
+
+    min_duration = 12.0
+    if end_time - start_time < min_duration:
         # Repair obviously broken ranges by expanding to a reasonable default.
         repaired_start = max(0.0, min(start_time, max(duration - 30.0, 0.0)))
-        repaired_end = repaired_start + 30.0
+        repaired_end = repaired_start + max(30.0, min_duration)
         if duration > 0:
             repaired_end = min(repaired_end, duration)
         start_time, end_time = repaired_start, repaired_end
 
-    if end_time <= start_time:
+    if end_time - start_time < min_duration:
         return None
 
     return {**highlight, "start_time": start_time, "end_time": end_time}
