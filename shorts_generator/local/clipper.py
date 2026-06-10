@@ -397,10 +397,10 @@ def get_stable_podcast_crop(
         w = max(1.0, x1 - x0)
         h = max(1.0, y1 - y0)
         anchor_x = x0 + (w / 2.0)
-        anchor_y = y0 + (h * 0.50)
+        anchor_y = y0 + (h * 0.42)
 
         prev_anchor_y = state.get("anchor_y_smoothed")
-        anchor_y = _smooth_value(float(prev_anchor_y) if prev_anchor_y is not None else None, anchor_y, 0.10)
+        anchor_y = _smooth_value(float(prev_anchor_y) if prev_anchor_y is not None else None, anchor_y, 0.06)
         state["anchor_y_smoothed"] = anchor_y
         return anchor_x, anchor_y
 
