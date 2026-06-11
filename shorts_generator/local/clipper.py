@@ -541,9 +541,14 @@ def get_stable_podcast_crop(
     state["pending_track_id"] = None
     state["pending_since"] = -1.0
 
-    final_x, final_y = _clamp_crop_origin(box[0], box[1], crop_w, crop_h, src_w, src_h)
-    state["smooth_crop_x"] = float(final_x)
-    state["smooth_crop_y"] = float(final_y)
+    target_crop_x, target_crop_y = target_crop_origin(candidate)
+    current_crop_x = float(smooth_crop_x if smooth_crop_x is not None else target_crop_x)
+    current_crop_y = float(smooth_crop_y if smooth_crop_y is not None else target_crop_y)
+    current_crop_x += (target_crop_x - current_crop_x) * 0.16
+    current_crop_y += (target_crop_y - current_crop_y) * 0.16
+    final_x, final_y = _clamp_crop_origin(current_crop_x, current_crop_y, crop_w, crop_h, src_w, src_h)
+    state["smooth_crop_x"] = float(current_crop_x)
+    state["smooth_crop_y"] = float(current_crop_y)
     state["final_crop_x"] = final_x
     state["final_crop_y"] = final_y
 
@@ -1086,26 +1091,21 @@ def _reframe_vertical_podcast_impl(
                 cropped = cv2.resize(cropped, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
             writer.write(cropped)
 
-            current_crop_center_x = (x0 + x1) / 2.0
-            current_crop_center_y = (y0 + y1) / 2.0
-            target_anchor_x = float(state.get("final_crop_x", x0) + (crop_w / 2.0))
-            target_anchor_y = float(state.get("final_crop_y", y0) + (crop_h / 2.0))
-            delta_x = target_anchor_x - current_crop_center_x
-            delta_y = target_anchor_y - current_crop_center_y
+            target_x = float(state.get("final_crop_x", x0))
+            target_y = float(state.get("final_crop_y", y0))
+            current_crop_x = float(x0)
+            current_crop_y = float(y0)
+            delta_x = target_x - current_crop_x
+            delta_y = target_y - current_crop_y
 
-            if abs(delta_x) <= dead_zone_threshold:
-                next_crop_x = float(x0)
-            else:
-                next_crop_x = float(x0 + (delta_x * 0.45))
+            if abs(delta_x) > dead_zone_threshold:
+                current_crop_x += delta_x * 0.22
+            if abs(delta_y) > dead_zone_threshold:
+                current_crop_y += delta_y * 0.22
 
-            if abs(delta_y) <= dead_zone_threshold:
-                next_crop_y = float(y0)
-            else:
-                next_crop_y = float(y0 + (delta_y * 0.45))
-
-            final_x, final_y = _clamp_crop_origin(next_crop_x, next_crop_y, crop_w, crop_h, src_w, src_h)
-            state["smooth_crop_x"] = float(next_crop_x)
-            state["smooth_crop_y"] = float(next_crop_y)
+            final_x, final_y = _clamp_crop_origin(current_crop_x, current_crop_y, crop_w, crop_h, src_w, src_h)
+            state["smooth_crop_x"] = float(current_crop_x)
+            state["smooth_crop_y"] = float(current_crop_y)
             state["final_crop_x"] = final_x
             state["final_crop_y"] = final_y
 
