@@ -71,6 +71,8 @@ CHUNK_SIZE_SECONDS = 1200       # 20-min chunks for long videos
 LONG_VIDEO_THRESHOLD = 1800     # chunk videos longer than 30 min
 CHUNK_OVERLAP_SECONDS = 60
 GPT_CALL_TIMEOUT_SECONDS = 300  # cap LLM polls at 5 min — a wedged call should fail fast
+TAVILY_QUERY_MAX_LEN = 220
+TAVILY_CONTEXT_MAX_LEN = 900
 
 
 def _extract_chunk_topic(transcript_text: str) -> str:
@@ -114,6 +116,20 @@ def _default_external_context_block() -> str:
     )
 
 
+def _compact_tavily_query(text: str) -> str:
+    query = re.sub(r"\s+", " ", (text or "")).strip()
+    if len(query) > TAVILY_QUERY_MAX_LEN:
+        query = query[:TAVILY_QUERY_MAX_LEN].rstrip()
+    return query
+
+
+def _compact_tavily_context(text: str) -> str:
+    context = re.sub(r"\s+", " ", (text or "")).strip()
+    if len(context) > TAVILY_CONTEXT_MAX_LEN:
+        context = context[:TAVILY_CONTEXT_MAX_LEN].rstrip()
+    return context
+
+
 def _build_external_context_block(chunk_topic: str) -> str:
     if not USE_TAVILY_CONTEXT or not TAVILY_API_KEY:
         return _default_external_context_block()
@@ -122,8 +138,11 @@ def _build_external_context_block(chunk_topic: str) -> str:
         from tavily import TavilyClient
 
         tavily_client = TavilyClient(api_key=os.environ.get("TAVILY_API_KEY"))
-        response = tavily_client.search(query=chunk_topic, search_depth="basic", max_results=3)
-        context = " ".join([r.get("content", "") for r in response.get("results", [])][:3]).strip()
+        query = _compact_tavily_query(chunk_topic)
+        if not query:
+            return _default_external_context_block()
+        response = tavily_client.search(query=query, search_depth="basic", max_results=3)
+        context = _compact_tavily_context(" ".join([r.get("content", "") for r in response.get("results", [])][:3]))
         if not context:
             context = "unavailable"
         return (
@@ -145,9 +164,13 @@ def _build_theme_locked_external_context_block(video_topic: str, chunk_topic: st
     if not USE_TAVILY_CONTEXT or not TAVILY_API_KEY:
         return _default_external_context_block()
 
-    combined_query = video_topic.strip()
-    if chunk_topic.strip() and chunk_topic.strip().lower() != video_topic.strip().lower():
-        combined_query = f"{video_topic}. Context tambahan dari bagian ini: {chunk_topic}"
+    combined_query = _compact_tavily_query(video_topic)
+    chunk_topic_compact = _compact_tavily_query(chunk_topic)
+    if chunk_topic_compact and chunk_topic_compact.lower() != combined_query.lower():
+        combined_query = _compact_tavily_query(f"{combined_query}. Context tambahan dari bagian ini: {chunk_topic_compact}")
+
+    if not combined_query:
+        return _default_external_context_block()
 
     try:
         from tavily import TavilyClient
@@ -156,10 +179,10 @@ def _build_theme_locked_external_context_block(video_topic: str, chunk_topic: st
         response = tavily_client.search(query=combined_query, search_depth="basic", max_results=3)
         contexts = []
         for result in response.get("results", [])[:3]:
-            content = str(result.get("content", "")).strip()
+            content = _compact_tavily_context(str(result.get("content", "")))
             if content:
                 contexts.append(content)
-        context = " ".join(contexts).strip() or "unavailable"
+        context = _compact_tavily_context(" ".join(contexts)) or "unavailable"
         return (
             f"[VIDEO THEME: {video_topic}] [EXTERNAL CONTEXT: {context}] "
             "Gunakan konteks eksternal ini untuk menilai sensitivitas, relevansi, dan potensi viral, "

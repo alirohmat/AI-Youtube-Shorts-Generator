@@ -1080,6 +1080,8 @@ def _reframe_vertical_podcast(
     aspect_ratio: str,
     debug: bool = False,
     srt_segments: Optional[Sequence[Dict]] = None,
+    start_time: float = 0.0,
+    end_time: Optional[float] = None,
 ) -> str:
     """Podcast wrapper with YOLO + SRT-aware active speaker detection.
 
@@ -1089,13 +1091,37 @@ def _reframe_vertical_podcast(
         from ultralytics import YOLO  # type: ignore  # noqa: F401
     except Exception as e:
         print(f"[PODCAST WARN] ultralytics unavailable ({e}). Using legacy crop.", flush=True)
-        return _reframe_vertical(in_path, out_path, aspect_ratio, debug=debug, srt_segments=srt_segments)
+        return _reframe_vertical(
+            in_path,
+            out_path,
+            aspect_ratio,
+            debug=debug,
+            srt_segments=srt_segments,
+            start_time=start_time,
+            end_time=end_time,
+        )
 
     try:
-        return _reframe_vertical_podcast_impl(in_path, out_path, aspect_ratio, debug=debug, srt_segments=srt_segments)
+        return _reframe_vertical_podcast_impl(
+            in_path,
+            out_path,
+            aspect_ratio,
+            debug=debug,
+            srt_segments=srt_segments,
+            start_time=start_time,
+            end_time=end_time,
+        )
     except Exception as e:
         print(f"[PODCAST WARN] YOLO pipeline failed ({e}). Using legacy crop.", flush=True)
-        return _reframe_vertical(in_path, out_path, aspect_ratio, debug=debug, srt_segments=srt_segments)
+        return _reframe_vertical(
+            in_path,
+            out_path,
+            aspect_ratio,
+            debug=debug,
+            srt_segments=srt_segments,
+            start_time=start_time,
+            end_time=end_time,
+        )
 
 
 def _reframe_vertical_podcast_impl(
