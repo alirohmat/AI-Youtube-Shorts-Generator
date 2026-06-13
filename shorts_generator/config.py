@@ -20,6 +20,8 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").strip().lower()
 LOCAL_WHISPER_MODEL = os.getenv("LOCAL_WHISPER_MODEL", "base")
 LOCAL_WHISPER_DEVICE = os.getenv("LOCAL_WHISPER_DEVICE", "auto")  # auto / cpu / cuda
 LOCAL_OUTPUT_DIR = os.getenv("LOCAL_OUTPUT_DIR", "output")
+CROP_FRAME_STRIDE = max(1, int(os.getenv("CROP_FRAME_STRIDE", "1")))
+CROP_INFERENCE_MAX_DIM = max(1, int(os.getenv("CROP_INFERENCE_MAX_DIM", "960")))
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "").strip()
 USE_TAVILY_CONTEXT = bool(TAVILY_API_KEY)
 

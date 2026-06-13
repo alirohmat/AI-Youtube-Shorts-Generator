@@ -11,6 +11,7 @@ runtime failure.
 
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from math import hypot
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -18,7 +19,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import cv2  # type: ignore
 import numpy as np  # type: ignore
 
-from ..config import LOCAL_OUTPUT_DIR
+from ..config import CROP_FRAME_STRIDE, CROP_INFERENCE_MAX_DIM, LOCAL_OUTPUT_DIR
 
 
 def _ratio(aspect_ratio: str) -> float:
@@ -102,6 +103,17 @@ def _clamp_crop_origin(
     final_x = max(0, min(int(crop_x), max(0, src_w - crop_w)))
     final_y = max(0, min(int(crop_y), max(0, src_h - crop_h)))
     return final_x, final_y
+
+
+def _resize_for_inference(frame: np.ndarray) -> Tuple[np.ndarray, float]:
+    height, width = frame.shape[:2]
+    max_dim = max(height, width)
+    if max_dim <= CROP_INFERENCE_MAX_DIM:
+        return frame, 1.0
+
+    scale = CROP_INFERENCE_MAX_DIM / float(max_dim)
+    resized = cv2.resize(frame, (int(round(width * scale)), int(round(height * scale))), interpolation=cv2.INTER_AREA)
+    return resized, scale
 
 
 def _box_wh(box: Tuple[float, float, float, float]) -> Tuple[float, float]:
@@ -306,6 +318,27 @@ def _extract_tracks(frame: np.ndarray, model) -> List[Dict]:
     return tracks
 
 
+def _extract_tracks_scaled(frame: np.ndarray, model, scale: float) -> List[Dict]:
+    tracks = _extract_tracks(frame, model)
+    if scale == 1.0:
+        return tracks
+
+    inv_scale = 1.0 / scale
+    scaled_tracks: List[Dict] = []
+    for track in tracks:
+        x0, y0, x1, y1 = track["bbox"]
+        scaled_bbox = (x0 * inv_scale, y0 * inv_scale, x1 * inv_scale, y1 * inv_scale)
+        scaled_tracks.append(
+            {
+                **track,
+                "bbox": scaled_bbox,
+                "center": _center_from_box(scaled_bbox),
+                "face_area": _box_area(scaled_bbox),
+            }
+        )
+    return scaled_tracks
+
+
 def get_stable_podcast_crop(
     frame: np.ndarray,
     current_timestamp: float,
@@ -325,13 +358,14 @@ def get_stable_podcast_crop(
     src_h, src_w = frame.shape[:2]
     target_ratio = _ratio("9:16")
     crop_w, crop_h = _fit_ratio(*_crop_size(src_w, src_h, target_ratio), target_ratio)
+    inference_frame, scale = _resize_for_inference(frame)
 
     model = _get_yolo_model()
     if model is None:
         return None, state
 
     try:
-        tracks = _extract_tracks(frame, model)
+        tracks = _extract_tracks_scaled(inference_frame, model, scale)
     except Exception as e:
         print(f"[PODCAST WARN] YOLO tracking failed: {e}", flush=True)
         return None, state
@@ -657,6 +691,8 @@ def _reframe_vertical(
     aspect_ratio: str,
     debug: bool = False,
     srt_segments: Optional[Sequence[Dict]] = None,
+    start_time: float = 0.0,
+    end_time: Optional[float] = None,
 ) -> str:
     """Legacy crop path.
 
@@ -669,8 +705,28 @@ def _reframe_vertical(
     src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     audio_energy = extract_audio_energy_array(in_path, fps)
+    start_frame = max(0, int(round(start_time * fps)))
+    end_frame = max(start_frame, int(round(end_time * fps))) if end_time is not None else None
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
     crop_w, crop_h = _fit_ratio(*_crop_size(src_w, src_h, target_ratio), target_ratio)
+    import mediapipe as mp  # type: ignore
+
+    pose = mp.solutions.pose.Pose(
+        static_image_mode=False,
+        model_complexity=1,
+        smooth_landmarks=True,
+        enable_segmentation=False,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    face_mesh = mp.solutions.face_mesh.FaceMesh(
+        static_image_mode=False,
+        max_num_faces=5,
+        refine_landmarks=True,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
     silent_path = out_path + ".silent.mp4"
@@ -819,32 +875,30 @@ def _reframe_vertical(
                 break
 
             frame_index = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
-            selected_subject = None
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            try:
-                import mediapipe as mp  # type: ignore
+            if end_frame is not None and frame_index > end_frame:
+                break
+            if CROP_FRAME_STRIDE > 1 and frame_index % CROP_FRAME_STRIDE != 0:
+                if last_center is None:
+                    last_center = (src_w // 2, src_h // 2)
+                cx, cy = last_center
+                x0 = max(0, min(src_w - crop_w, cx - crop_w // 2))
+                y0 = max(0, min(src_h - crop_h, cy - crop_h // 2))
+                cropped = frame[y0 : y0 + crop_h, x0 : x0 + crop_w]
+                writer.write(cropped)
+                if debug and debug_writer is not None:
+                    debug_writer.write(frame)
+                continue
 
-                pose = mp.solutions.pose.Pose(
-                    static_image_mode=False,
-                    model_complexity=1,
-                    smooth_landmarks=True,
-                    enable_segmentation=False,
-                    min_detection_confidence=0.5,
-                    min_tracking_confidence=0.5,
-                )
-                face_mesh = mp.solutions.face_mesh.FaceMesh(
-                    static_image_mode=False,
-                    max_num_faces=5,
-                    refine_landmarks=True,
-                    min_detection_confidence=0.5,
-                    min_tracking_confidence=0.5,
-                )
+            selected_subject = None
+            inference_frame, scale = _resize_for_inference(frame)
+            rgb = cv2.cvtColor(inference_frame, cv2.COLOR_BGR2RGB)
+            try:
                 pose_result = pose.process(rgb)
                 face_result = face_mesh.process(rgb)
                 pose_center = None
                 if pose_result.pose_landmarks:
                     landmarks = pose_result.pose_landmarks
-                    h, w = frame.shape[:2]
+                    h, w = inference_frame.shape[:2]
                     candidates: List[Tuple[Tuple[int, int], float]] = []
                     for landmark, weight in (
                         (mp.solutions.pose.PoseLandmark.NOSE, 3.0),
@@ -868,10 +922,10 @@ def _reframe_vertical(
                     for idx, face_landmarks in enumerate(face_result.multi_face_landmarks):
                         xs = [lm.x for lm in face_landmarks.landmark]
                         ys = [lm.y for lm in face_landmarks.landmark]
-                        x0 = max(0, int(min(xs) * src_w))
-                        y0 = max(0, int(min(ys) * src_h))
-                        x1 = min(src_w, int(max(xs) * src_w))
-                        y1 = min(src_h, int(max(ys) * src_h))
+                        x0 = max(0, int(min(xs) * inference_frame.shape[1]))
+                        y0 = max(0, int(min(ys) * inference_frame.shape[0]))
+                        x1 = min(inference_frame.shape[1], int(max(xs) * inference_frame.shape[1]))
+                        y1 = min(inference_frame.shape[0], int(max(ys) * inference_frame.shape[0]))
                         face_area = max(1, (x1 - x0) * (y1 - y0))
                         face_center = ((x0 + x1) // 2, (y0 + y1) // 2)
                         top = face_landmarks.landmark[13]
@@ -896,15 +950,18 @@ def _reframe_vertical(
                         face_data.append(
                             {
                                 "face_id": idx,
-                                "face_center": face_center,
-                                "face_area": face_area,
+                                "face_center": (int(face_center[0] / scale), int(face_center[1] / scale)),
+                                "face_area": int(face_area / (scale * scale)) if scale > 0 else face_area,
                                 "mouth_openness_variance": mouth_variance,
                                 "reaction_score": reaction_score,
                             }
                         )
                 pose_data = None
                 if pose_center is not None:
-                    pose_data = {"pose_center": pose_center, "pose_stability": 1.0}
+                    pose_data = {
+                        "pose_center": (int(pose_center[0] / scale), int(pose_center[1] / scale)),
+                        "pose_stability": 1.0,
+                    }
                 selected_subject = _best_subject(frame, face_data, pose_data, audio_energy, frame_index)
             except Exception:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -980,6 +1037,8 @@ def _reframe_vertical(
                 debug_writer.write(overlay)
     finally:
         cap.release()
+        pose.close()
+        face_mesh.close()
         writer.release()
         if debug_writer is not None:
             debug_writer.release()
@@ -990,6 +1049,10 @@ def _reframe_vertical(
         "error",
         "-i",
         silent_path,
+        "-ss",
+        f"{start_time:.3f}",
+        "-to",
+        f"{end_time:.3f}" if end_time is not None else f"{(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) / max(fps, 1.0):.3f}",
         "-i",
         in_path,
         "-c:v",
@@ -1041,6 +1104,8 @@ def _reframe_vertical_podcast_impl(
     aspect_ratio: str,
     debug: bool = False,
     srt_segments: Optional[Sequence[Dict]] = None,
+    start_time: float = 0.0,
+    end_time: Optional[float] = None,
 ) -> str:
     try:
         from ultralytics import YOLO  # type: ignore
@@ -1055,8 +1120,9 @@ def _reframe_vertical_podcast_impl(
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     crop_w, crop_h = _crop_size(src_w, src_h, target_ratio)
     dead_zone_threshold = max(15.0, crop_w * 0.06)
-
-    model = YOLO("yolov8n.pt")
+    start_frame = max(0, int(round(start_time * fps)))
+    end_frame = max(start_frame, int(round(end_time * fps))) if end_time is not None else None
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
     silent_path = out_path + ".silent.mp4"
     debug_path = os.path.join(os.path.dirname(out_path), "output_debug.mp4") if debug else None
@@ -1072,8 +1138,30 @@ def _reframe_vertical_podcast_impl(
             if not ret:
                 break
 
+            frame_index = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+            if end_frame is not None and frame_index > end_frame:
+                break
+            if CROP_FRAME_STRIDE > 1 and frame_index % CROP_FRAME_STRIDE != 0:
+                x0 = int(state.get("final_crop_x", 0))
+                y0 = int(state.get("final_crop_y", 0))
+                x0 = max(0, min(x0, max(0, src_w - crop_w)))
+                y0 = max(0, min(y0, max(0, src_h - crop_h)))
+                x1 = x0 + crop_w
+                y1 = y0 + crop_h
+                cropped = frame[y0:y1, x0:x1]
+                if cropped.shape[0] != crop_h or cropped.shape[1] != crop_w:
+                    cropped = cv2.resize(cropped, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
+                writer.write(cropped)
+                if debug and debug_writer is not None:
+                    debug_writer.write(frame)
+                continue
+
             current_timestamp = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0) / 1000.0
-            box, state = get_stable_podcast_crop(frame, current_timestamp, srt_segments or [], {**state, "prev_gray": prev_gray}, debug=debug)
+            model = _get_yolo_model()
+            if model is None:
+                box, state = None, state
+            else:
+                box, state = get_stable_podcast_crop(frame, current_timestamp, srt_segments or [], {**state, "prev_gray": prev_gray}, debug=debug)
             prev_gray = state.get("prev_gray")
 
             if box is None:
@@ -1135,6 +1223,10 @@ def _reframe_vertical_podcast_impl(
         "error",
         "-i",
         silent_path,
+        "-ss",
+        f"{start_time:.3f}",
+        "-to",
+        f"{end_time:.3f}" if end_time is not None else f"{(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) / max(fps, 1.0):.3f}",
         "-i",
         in_path,
         "-c:v",
@@ -1166,17 +1258,27 @@ def crop_clip_local(
     debug: bool = False,
     podcast: bool = False,
 ) -> str:
-    cut_path = out_path + ".cut.mp4"
-    try:
-        _cut_subclip(source_path, start_time, end_time, cut_path)
-        clip_segments = _slice_segments_for_clip(srt_segments or [], start_time, end_time)
-        if podcast:
-            _reframe_vertical_podcast(cut_path, out_path, aspect_ratio, debug=debug, srt_segments=clip_segments)
-        else:
-            _reframe_vertical(cut_path, out_path, aspect_ratio, debug=debug, srt_segments=clip_segments)
-    finally:
-        if os.path.exists(cut_path):
-            os.remove(cut_path)
+    clip_segments = _slice_segments_for_clip(srt_segments or [], start_time, end_time)
+    if podcast:
+        _reframe_vertical_podcast(
+            source_path,
+            out_path,
+            aspect_ratio,
+            debug=debug,
+            srt_segments=clip_segments,
+            start_time=start_time,
+            end_time=end_time,
+        )
+    else:
+        _reframe_vertical(
+            source_path,
+            out_path,
+            aspect_ratio,
+            debug=debug,
+            srt_segments=clip_segments,
+            start_time=start_time,
+            end_time=end_time,
+        )
     return out_path
 
 
@@ -1191,24 +1293,38 @@ def crop_highlights_local(
 ) -> List[Dict]:
     out_dir = out_dir or LOCAL_OUTPUT_DIR
     os.makedirs(out_dir, exist_ok=True)
-    results: List[Dict] = []
     transcript_segments = transcript.get("segments", []) if transcript else []
-    for i, h in enumerate(highlights, 1):
+    results: List[Dict] = [None] * len(highlights)  # type: ignore[list-item]
+
+    def _crop_one(index: int, highlight: Dict) -> Dict:
+        i = index + 1
         out_path = os.path.join(out_dir, f"short_{i:02d}.mp4")
-        print(f"[clip/local] {i}/{len(highlights)}: {h.get('title', '(untitled)')}", flush=True)
+        print(f"[clip/local] {i}/{len(highlights)}: {highlight.get('title', '(untitled)')}", flush=True)
         try:
             crop_clip_local(
                 source_path,
-                float(h["start_time"]),
-                float(h["end_time"]),
+                float(highlight["start_time"]),
+                float(highlight["end_time"]),
                 aspect_ratio,
                 out_path,
                 srt_segments=transcript_segments,
                 debug=debug,
                 podcast=podcast,
             )
-            results.append({**h, "clip_url": out_path})
+            return {**highlight, "clip_url": out_path}
         except Exception as e:
             print(f"[clip/local] {i} failed: {e}", flush=True)
-            results.append({**h, "clip_url": None, "error": str(e)})
+            return {**highlight, "clip_url": None, "error": str(e)}
+
+    max_workers = min(len(highlights), max(1, (os.cpu_count() or 2) // 2))
+    if len(highlights) <= 1 or max_workers <= 1:
+        for index, highlight in enumerate(highlights):
+            results[index] = _crop_one(index, highlight)
+        return results
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_crop_one, index, highlight) for index, highlight in enumerate(highlights)]
+        for index, future in enumerate(futures):
+            results[index] = future.result()
+
     return results
