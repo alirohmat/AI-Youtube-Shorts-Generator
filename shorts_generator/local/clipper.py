@@ -11,6 +11,7 @@ runtime failure.
 
 import os
 import subprocess
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from math import hypot
 from pathlib import Path
@@ -633,6 +634,90 @@ def _open_video_capture(path: str, retries: int = 8, delay_seconds: float = 0.25
     raise RuntimeError(f"could not open {path}")
 
 
+def _transcode_to_decodeable_mp4(source_path: str) -> str:
+    """Create a temporary H.264/AAC copy that OpenCV can reliably decode.
+
+    This is a best-effort compatibility shim for inputs like AV1/WebM/MKV that
+    may not decode through the local OpenCV build even when ffmpeg itself can
+    read them.
+    """
+    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    tmp_file.close()
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        source_path,
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "20",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        tmp_file.name,
+    ]
+    try:
+        subprocess.run(cmd, check=True)
+    except Exception:
+        try:
+            os.remove(tmp_file.name)
+        except OSError:
+            pass
+        raise
+    return tmp_file.name
+
+
+def _prepare_decodeable_input(path: str) -> Tuple[str, bool]:
+    """Return a decodeable path, transcoding to temp mp4 if needed."""
+    cap = None
+    try:
+        cap = _open_video_capture(path)
+    except Exception:
+        print(f"[clip/local] source is not decodeable by OpenCV, transcoding: {path}", flush=True)
+        temp_path = _transcode_to_decodeable_mp4(path)
+        cap = _open_video_capture(temp_path)
+        cap.release()
+        return temp_path, True
+
+    try:
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if width <= 0 or height <= 0:
+            raise RuntimeError("OpenCV reported invalid frame dimensions")
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            raise RuntimeError("OpenCV could not read first frame")
+        return path, False
+    except Exception:
+        print(f"[clip/local] source opened but looks invalid, transcoding: {path}", flush=True)
+        temp_path = _transcode_to_decodeable_mp4(path)
+        cap.release()
+        try:
+            cap = _open_video_capture(temp_path)
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                raise RuntimeError("transcoded video still not readable")
+            cap.release()
+        except Exception:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+            raise
+        return temp_path, True
+    finally:
+        if cap is not None:
+            cap.release()
+
+
 def extract_audio_energy_array(video_path: str, fps: float) -> List[float]:
     try:
         import librosa  # type: ignore
@@ -699,34 +784,43 @@ def _reframe_vertical(
     This is intentionally left as the safe fallback path.
     """
     target_ratio = _ratio(aspect_ratio)
-    cap = _open_video_capture(in_path)
+    decode_path, should_cleanup_decode_path = _prepare_decodeable_input(in_path)
+    cap = _open_video_capture(decode_path)
 
     src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    audio_energy = extract_audio_energy_array(in_path, fps)
+    audio_energy = extract_audio_energy_array(decode_path, fps)
     start_frame = max(0, int(round(start_time * fps)))
     end_frame = max(start_frame, int(round(end_time * fps))) if end_time is not None else None
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
     crop_w, crop_h = _fit_ratio(*_crop_size(src_w, src_h, target_ratio), target_ratio)
-    import mediapipe as mp  # type: ignore
+    mp = None
+    pose = None
+    face_mesh = None
+    try:
+        import mediapipe as mp  # type: ignore
 
-    pose = mp.solutions.pose.Pose(
-        static_image_mode=False,
-        model_complexity=1,
-        smooth_landmarks=True,
-        enable_segmentation=False,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
-    face_mesh = mp.solutions.face_mesh.FaceMesh(
-        static_image_mode=False,
-        max_num_faces=5,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
+        pose = mp.solutions.pose.Pose(
+            static_image_mode=False,
+            model_complexity=1,
+            smooth_landmarks=True,
+            enable_segmentation=False,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        face_mesh = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=5,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+    except Exception:
+        mp = None
+        pose = None
+        face_mesh = None
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
     silent_path = out_path + ".silent.mp4"
@@ -734,6 +828,7 @@ def _reframe_vertical(
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(silent_path, fourcc, fps, (crop_w, crop_h))
     debug_writer = cv2.VideoWriter(debug_path, fourcc, fps, (src_w, src_h)) if debug_path else None
+    source_duration = (cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) / max(fps, 1.0)
 
     last_center: Optional[Tuple[int, int]] = None
     smoothing = 0.18
@@ -891,79 +986,107 @@ def _reframe_vertical(
 
             selected_subject = None
             inference_frame, scale = _resize_for_inference(frame)
-            rgb = cv2.cvtColor(inference_frame, cv2.COLOR_BGR2RGB)
-            try:
-                pose_result = pose.process(rgb)
-                face_result = face_mesh.process(rgb)
-                pose_center = None
-                if pose_result.pose_landmarks:
-                    landmarks = pose_result.pose_landmarks
-                    h, w = inference_frame.shape[:2]
-                    candidates: List[Tuple[Tuple[int, int], float]] = []
-                    for landmark, weight in (
-                        (mp.solutions.pose.PoseLandmark.NOSE, 3.0),
-                        (mp.solutions.pose.PoseLandmark.LEFT_SHOULDER, 2.0),
-                        (mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER, 2.0),
-                        (mp.solutions.pose.PoseLandmark.LEFT_HIP, 1.5),
-                        (mp.solutions.pose.PoseLandmark.RIGHT_HIP, 1.5),
-                    ):
-                        lm = landmarks.landmark[landmark]
-                        if lm.visibility < 0.45:
-                            continue
-                        candidates.append(((int(lm.x * w), int(lm.y * h)), weight))
-                    if candidates:
-                        total = sum(weight for _, weight in candidates)
-                        pose_center = (
-                            int(sum(point[0] * weight for point, weight in candidates) / total),
-                            int(sum(point[1] * weight for point, weight in candidates) / total),
+            if pose is not None and face_mesh is not None and mp is not None:
+                rgb = cv2.cvtColor(inference_frame, cv2.COLOR_BGR2RGB)
+                try:
+                    pose_result = pose.process(rgb)
+                    face_result = face_mesh.process(rgb)
+                    pose_center = None
+                    if pose_result.pose_landmarks:
+                        landmarks = pose_result.pose_landmarks
+                        h, w = inference_frame.shape[:2]
+                        candidates: List[Tuple[Tuple[int, int], float]] = []
+                        for landmark, weight in (
+                            (mp.solutions.pose.PoseLandmark.NOSE, 3.0),
+                            (mp.solutions.pose.PoseLandmark.LEFT_SHOULDER, 2.0),
+                            (mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER, 2.0),
+                            (mp.solutions.pose.PoseLandmark.LEFT_HIP, 1.5),
+                            (mp.solutions.pose.PoseLandmark.RIGHT_HIP, 1.5),
+                        ):
+                            lm = landmarks.landmark[landmark]
+                            if lm.visibility < 0.45:
+                                continue
+                            candidates.append(((int(lm.x * w), int(lm.y * h)), weight))
+                        if candidates:
+                            total = sum(weight for _, weight in candidates)
+                            pose_center = (
+                                int(sum(point[0] * weight for point, weight in candidates) / total),
+                                int(sum(point[1] * weight for point, weight in candidates) / total),
+                            )
+                    face_data: List[Dict] = []
+                    if face_result.multi_face_landmarks:
+                        for idx, face_landmarks in enumerate(face_result.multi_face_landmarks):
+                            xs = [lm.x for lm in face_landmarks.landmark]
+                            ys = [lm.y for lm in face_landmarks.landmark]
+                            x0 = max(0, int(min(xs) * inference_frame.shape[1]))
+                            y0 = max(0, int(min(ys) * inference_frame.shape[0]))
+                            x1 = min(inference_frame.shape[1], int(max(xs) * inference_frame.shape[1]))
+                            y1 = min(inference_frame.shape[0], int(max(ys) * inference_frame.shape[0]))
+                            face_area = max(1, (x1 - x0) * (y1 - y0))
+                            face_center = ((x0 + x1) // 2, (y0 + y1) // 2)
+                            top = face_landmarks.landmark[13]
+                            bottom = face_landmarks.landmark[14]
+                            mouth_variance = float(hypot(top.x - bottom.x, top.y - bottom.y))
+                            lm = face_landmarks.landmark
+                            left_eye_open = hypot(
+                                lm[159].x - lm[145].x, lm[159].y - lm[145].y
+                            )
+                            right_eye_open = hypot(
+                                lm[386].x - lm[374].x, lm[386].y - lm[374].y
+                            )
+                            eye_openness = (left_eye_open + right_eye_open) / 2.0
+                            mouth_width = hypot(
+                                lm[61].x - lm[291].x, lm[61].y - lm[291].y
+                            )
+                            reaction_score = max(
+                                min(eye_openness / 0.04, 1.0),
+                                min(mouth_variance / 0.06, 1.0),
+                                min(mouth_width / 0.18, 1.0),
+                            )
+                            face_data.append(
+                                {
+                                    "face_id": idx,
+                                    "face_center": (int(face_center[0] / scale), int(face_center[1] / scale)),
+                                    "face_area": int(face_area / (scale * scale)) if scale > 0 else face_area,
+                                    "mouth_openness_variance": mouth_variance,
+                                    "reaction_score": reaction_score,
+                                }
+                            )
+                    pose_data = None
+                    if pose_center is not None:
+                        pose_data = {
+                            "pose_center": (int(pose_center[0] / scale), int(pose_center[1] / scale)),
+                            "pose_stability": 1.0,
+                        }
+                    selected_subject = _best_subject(frame, face_data, pose_data, audio_energy, frame_index)
+                except Exception:
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
+                    next_center = None
+                    if len(faces) > 0:
+                        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+                        next_center = (x + w // 2, y + h // 2)
+                    if next_center is None:
+                        next_center = (src_w // 2, src_h // 2)
+
+                    if last_center is None:
+                        last_center = next_center
+                    else:
+                        lx, ly = last_center
+                        cx, cy = next_center
+                        last_center = (
+                            int(lx + (cx - lx) * smoothing),
+                            int(ly + (cy - ly) * smoothing),
                         )
-                face_data: List[Dict] = []
-                if face_result.multi_face_landmarks:
-                    for idx, face_landmarks in enumerate(face_result.multi_face_landmarks):
-                        xs = [lm.x for lm in face_landmarks.landmark]
-                        ys = [lm.y for lm in face_landmarks.landmark]
-                        x0 = max(0, int(min(xs) * inference_frame.shape[1]))
-                        y0 = max(0, int(min(ys) * inference_frame.shape[0]))
-                        x1 = min(inference_frame.shape[1], int(max(xs) * inference_frame.shape[1]))
-                        y1 = min(inference_frame.shape[0], int(max(ys) * inference_frame.shape[0]))
-                        face_area = max(1, (x1 - x0) * (y1 - y0))
-                        face_center = ((x0 + x1) // 2, (y0 + y1) // 2)
-                        top = face_landmarks.landmark[13]
-                        bottom = face_landmarks.landmark[14]
-                        mouth_variance = float(hypot(top.x - bottom.x, top.y - bottom.y))
-                        lm = face_landmarks.landmark
-                        left_eye_open = hypot(
-                            lm[159].x - lm[145].x, lm[159].y - lm[145].y
-                        )
-                        right_eye_open = hypot(
-                            lm[386].x - lm[374].x, lm[386].y - lm[374].y
-                        )
-                        eye_openness = (left_eye_open + right_eye_open) / 2.0
-                        mouth_width = hypot(
-                            lm[61].x - lm[291].x, lm[61].y - lm[291].y
-                        )
-                        reaction_score = max(
-                            min(eye_openness / 0.04, 1.0),
-                            min(mouth_variance / 0.06, 1.0),
-                            min(mouth_width / 0.18, 1.0),
-                        )
-                        face_data.append(
-                            {
-                                "face_id": idx,
-                                "face_center": (int(face_center[0] / scale), int(face_center[1] / scale)),
-                                "face_area": int(face_area / (scale * scale)) if scale > 0 else face_area,
-                                "mouth_openness_variance": mouth_variance,
-                                "reaction_score": reaction_score,
-                            }
-                        )
-                pose_data = None
-                if pose_center is not None:
-                    pose_data = {
-                        "pose_center": (int(pose_center[0] / scale), int(pose_center[1] / scale)),
-                        "pose_stability": 1.0,
-                    }
-                selected_subject = _best_subject(frame, face_data, pose_data, audio_energy, frame_index)
-            except Exception:
+                    cx, cy = last_center
+                    x0 = max(0, min(src_w - crop_w, cx - crop_w // 2))
+                    y0 = max(0, min(src_h - crop_h, cy - crop_h // 2))
+                    cropped = frame[y0 : y0 + crop_h, x0 : x0 + crop_w]
+                    writer.write(cropped)
+                    if debug and debug_writer is not None:
+                        debug_writer.write(frame)
+                    continue
+            else:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
                 next_center = None
@@ -1037,8 +1160,10 @@ def _reframe_vertical(
                 debug_writer.write(overlay)
     finally:
         cap.release()
-        pose.close()
-        face_mesh.close()
+        if pose is not None:
+            pose.close()
+        if face_mesh is not None:
+            face_mesh.close()
         writer.release()
         if debug_writer is not None:
             debug_writer.release()
@@ -1052,7 +1177,7 @@ def _reframe_vertical(
         "-ss",
         f"{start_time:.3f}",
         "-to",
-        f"{end_time:.3f}" if end_time is not None else f"{(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) / max(fps, 1.0):.3f}",
+        f"{end_time:.3f}" if end_time is not None else f"{source_duration:.3f}",
         "-i",
         in_path,
         "-c:v",
@@ -1071,6 +1196,11 @@ def _reframe_vertical(
     subprocess.run(cmd, check=True)
     if os.path.exists(silent_path):
         os.remove(silent_path)
+    if should_cleanup_decode_path:
+        try:
+            os.remove(decode_path)
+        except OSError:
+            pass
     return out_path
 
 
@@ -1139,7 +1269,8 @@ def _reframe_vertical_podcast_impl(
         raise RuntimeError(f"ultralytics import failed: {e}") from e
 
     target_ratio = _ratio(aspect_ratio)
-    cap = _open_video_capture(in_path)
+    decode_path, should_cleanup_decode_path = _prepare_decodeable_input(in_path)
+    cap = _open_video_capture(decode_path)
 
     src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -1155,6 +1286,7 @@ def _reframe_vertical_podcast_impl(
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(silent_path, fourcc, fps, (crop_w, crop_h))
     debug_writer = cv2.VideoWriter(debug_path, fourcc, fps, (src_w, src_h)) if debug_path else None
+    source_duration = (cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) / max(fps, 1.0)
 
     state: Dict = {}
     prev_gray: Optional[np.ndarray] = None
@@ -1252,7 +1384,7 @@ def _reframe_vertical_podcast_impl(
         "-ss",
         f"{start_time:.3f}",
         "-to",
-        f"{end_time:.3f}" if end_time is not None else f"{(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) / max(fps, 1.0):.3f}",
+        f"{end_time:.3f}" if end_time is not None else f"{source_duration:.3f}",
         "-i",
         in_path,
         "-c:v",
@@ -1271,6 +1403,11 @@ def _reframe_vertical_podcast_impl(
     subprocess.run(cmd, check=True)
     if os.path.exists(silent_path):
         os.remove(silent_path)
+    if should_cleanup_decode_path:
+        try:
+            os.remove(decode_path)
+        except OSError:
+            pass
     return out_path
 
 

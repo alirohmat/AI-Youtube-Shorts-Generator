@@ -30,8 +30,9 @@ def _format_for(fmt: str) -> str:
     except ValueError:
         height = 720
     return (
-        f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
-        f"best[height<={height}][ext=mp4]/best"
+        f"bestvideo[height<={height}][ext=mp4][vcodec!^=av01]+bestaudio[ext=m4a]/"
+        f"bestvideo[height<={height}][vcodec!^=av01]+bestaudio[ext=m4a]/"
+        f"best[height<={height}][ext=mp4][vcodec!^=av01]/best"
     )
 
 
