@@ -12,6 +12,7 @@ runtime failure.
 import os
 import subprocess
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from math import hypot
 from pathlib import Path
@@ -21,6 +22,33 @@ import cv2  # type: ignore
 import numpy as np  # type: ignore
 
 from ..config import CROP_FRAME_STRIDE, CROP_INFERENCE_MAX_DIM, LOCAL_OUTPUT_DIR
+
+_mp_lock = threading.Lock()
+_mp_disabled = False
+
+_yolo_lock = threading.Lock()
+
+
+def _resolve_cuda_device() -> Optional[int]:
+    try:
+        import torch  # type: ignore
+    except ImportError:
+        return None
+
+    return 0 if torch.cuda.is_available() else None
+
+
+def _mark_mediapipe_failed() -> None:
+    global _mp_disabled
+    with _mp_lock:
+        if not _mp_disabled:
+            _mp_disabled = True
+            print("[clip/local] MediaPipe disabled after runtime error", flush=True)
+
+
+def _is_mediapipe_disabled() -> bool:
+    with _mp_lock:
+        return _mp_disabled
 
 
 def _ratio(aspect_ratio: str) -> float:
@@ -252,34 +280,59 @@ def _get_yolo_model():
     """Lazy-load YOLOv8n for podcast crop detection.
 
     Returns None if the model cannot be loaded so callers can fall back safely.
+    Thread-safe via _yolo_lock.
     """
     cached = getattr(_get_yolo_model, "_cached", None)
     if cached is not None:
         return cached
 
-    try:
-        from ultralytics import YOLO  # type: ignore
-    except Exception as e:
-        print(f"[PODCAST WARN] ultralytics unavailable: {e}", flush=True)
-        return None
+    with _yolo_lock:
+        cached = getattr(_get_yolo_model, "_cached", None)
+        if cached is not None:
+            return cached
 
-    try:
-        model = YOLO("yolov8n.pt")
-    except Exception as e:
-        print(f"[PODCAST WARN] failed to load YOLOv8n: {e}", flush=True)
-        return None
+        try:
+            from ultralytics import YOLO  # type: ignore
+        except Exception as e:
+            print(f"[PODCAST WARN] ultralytics unavailable: {e}", flush=True)
+            return None
 
-    setattr(_get_yolo_model, "_cached", model)
-    return model
+        try:
+            model = YOLO("yolov8n.pt")
+        except Exception as e:
+            print(f"[PODCAST WARN] failed to load YOLOv8n: {e}", flush=True)
+            return None
+
+        cuda_device = _resolve_cuda_device()
+        if cuda_device is not None:
+            try:
+                model.to("cuda")
+                setattr(_get_yolo_model, "_device", cuda_device)
+                setattr(_get_yolo_model, "_half", True)
+                print("[PODCAST] YOLO using CUDA", flush=True)
+            except Exception as e:
+                print(f"[PODCAST WARN] failed to move YOLO to CUDA: {e}", flush=True)
+                setattr(_get_yolo_model, "_device", None)
+                setattr(_get_yolo_model, "_half", False)
+        else:
+            setattr(_get_yolo_model, "_device", None)
+            setattr(_get_yolo_model, "_half", False)
+
+        setattr(_get_yolo_model, "_cached", model)
+        return model
 
 
 def _extract_tracks(frame: np.ndarray, model) -> List[Dict]:
+    device = getattr(_get_yolo_model, "_device", None)
+    half = bool(getattr(_get_yolo_model, "_half", False))
     results = model.track(
         frame,
         persist=True,
         tracker="bytetrack.yaml",
         verbose=False,
         classes=[0],
+        device=device,
+        half=half,
     )
     if not results:
         return []
@@ -799,28 +852,30 @@ def _reframe_vertical(
     mp = None
     pose = None
     face_mesh = None
-    try:
-        import mediapipe as mp  # type: ignore
+    if not _is_mediapipe_disabled():
+        try:
+            import mediapipe as mp  # type: ignore
 
-        pose = mp.solutions.pose.Pose(
-            static_image_mode=False,
-            model_complexity=1,
-            smooth_landmarks=True,
-            enable_segmentation=False,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
-        face_mesh = mp.solutions.face_mesh.FaceMesh(
-            static_image_mode=False,
-            max_num_faces=5,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
-    except Exception:
-        mp = None
-        pose = None
-        face_mesh = None
+            pose = mp.solutions.pose.Pose(
+                static_image_mode=False,
+                model_complexity=1,
+                smooth_landmarks=True,
+                enable_segmentation=False,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+            face_mesh = mp.solutions.face_mesh.FaceMesh(
+                static_image_mode=False,
+                max_num_faces=5,
+                refine_landmarks=True,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+        except Exception:
+            mp = None
+            pose = None
+            face_mesh = None
+            _mark_mediapipe_failed()
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
     silent_path = out_path + ".silent.mp4"
@@ -1060,6 +1115,7 @@ def _reframe_vertical(
                         }
                     selected_subject = _best_subject(frame, face_data, pose_data, audio_energy, frame_index)
                 except Exception:
+                    _mark_mediapipe_failed()
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                     faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
                     next_center = None
@@ -1459,13 +1515,17 @@ def crop_highlights_local(
     transcript_segments = transcript.get("segments", []) if transcript else []
     results: List[Dict] = [None] * len(highlights)  # type: ignore[list-item]
 
+    decode_path, should_cleanup_decode = _prepare_decodeable_input(source_path)
+    if should_cleanup_decode:
+        print(f"[clip/local] pre-transcoded source to H.264: {decode_path}", flush=True)
+
     def _crop_one(index: int, highlight: Dict) -> Dict:
         i = index + 1
         out_path = os.path.join(out_dir, f"short_{i:02d}.mp4")
         print(f"[clip/local] {i}/{len(highlights)}: {highlight.get('title', '(untitled)')}", flush=True)
         try:
             crop_clip_local(
-                source_path,
+                decode_path,
                 float(highlight["start_time"]),
                 float(highlight["end_time"]),
                 aspect_ratio,
@@ -1479,15 +1539,27 @@ def crop_highlights_local(
             print(f"[clip/local] {i} failed: {e}", flush=True)
             return {**highlight, "clip_url": None, "error": str(e)}
 
-    max_workers = min(len(highlights), max(1, (os.cpu_count() or 2) // 2))
-    if len(highlights) <= 1 or max_workers <= 1:
-        for index, highlight in enumerate(highlights):
-            results[index] = _crop_one(index, highlight)
-        return results
+    try:
+        if podcast:
+            for index, highlight in enumerate(highlights):
+                results[index] = _crop_one(index, highlight)
+            return results
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_crop_one, index, highlight) for index, highlight in enumerate(highlights)]
-        for index, future in enumerate(futures):
-            results[index] = future.result()
+        max_workers = min(len(highlights), max(1, (os.cpu_count() or 2) // 2))
+        if len(highlights) <= 1 or max_workers <= 1:
+            for index, highlight in enumerate(highlights):
+                results[index] = _crop_one(index, highlight)
+            return results
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_crop_one, index, highlight) for index, highlight in enumerate(highlights)]
+            for index, future in enumerate(futures):
+                results[index] = future.result()
+    finally:
+        if should_cleanup_decode:
+            try:
+                os.remove(decode_path)
+            except OSError:
+                pass
 
     return results
