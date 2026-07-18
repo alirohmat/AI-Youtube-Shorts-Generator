@@ -1,64 +1,1565 @@
-class VirtualCamera:
-    def __init__(self, frame_width, frame_height, deadzone_percent=0.15,
-                 alpha_min=0.02, alpha_max=0.25,
-                 score_margin=0.2, lock_frames=30):
-        self.frame_width = frame_width
-        self.frame_height = frame_height
-        self.deadzone_x = frame_width * deadzone_percent
-        self.deadzone_y = frame_height * deadzone_percent
-        self.alpha_min = alpha_min
-        self.alpha_max = alpha_max
-        self.score_margin = score_margin
-        self.lock_frames = lock_frames
+"""Local clipping: ffmpeg subclip + vertical crop.
 
-        self.x = frame_width / 2.0
-        self.y = frame_height / 2.0
+Two stages per highlight:
+  1. Cut the source video to [start, end] with ffmpeg (re-encoded, audio kept).
+  2. Reframe the cut to the target aspect ratio.
 
-        self.locked_id = None
-        self.locked_score = 0.0
-        self.target_x = frame_width / 2.0
-        self.target_y = frame_height / 2.0
-        self.pending_id = None
-        self.pending_count = 0
+The legacy cropper remains the default safe path. A podcast-specific YOLO
+pipeline can be enabled by callers and falls back to the legacy path on any
+runtime failure.
+"""
 
-    def update(self, subject):
-        sid, score, tx, ty = subject['id'], subject['score'], subject['x'], subject['y']
+import os
+import subprocess
+import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from math import hypot
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
 
-        if self.locked_id is None:
-            self.locked_id = sid
-            self.locked_score = score
-            self.target_x, self.target_y = tx, ty
+import cv2  # type: ignore
+import numpy as np  # type: ignore
 
-        elif sid != self.locked_id:
-            if score > self.locked_score * (1 + self.score_margin):
-                if self.pending_id != sid:
-                    self.pending_id = sid
-                    self.pending_count = 0
-                self.pending_count += 1
-                if self.pending_count >= self.lock_frames:
-                    self.locked_id = sid
-                    self.locked_score = score
-                    self.target_x, self.target_y = tx, ty
-                    self.pending_id = None
-                    self.pending_count = 0
-            else:
-                self.pending_id = None
-                self.pending_count = 0
+from ..config import CROP_FRAME_STRIDE, CROP_INFERENCE_MAX_DIM, LOCAL_OUTPUT_DIR
 
+_mp_lock = threading.Lock()
+_mp_disabled = False
+
+_yolo_lock = threading.Lock()
+
+
+def _resolve_cuda_device() -> Optional[int]:
+    try:
+        import torch  # type: ignore
+    except ImportError:
+        return None
+
+    return 0 if torch.cuda.is_available() else None
+
+
+def _mark_mediapipe_failed() -> None:
+    global _mp_disabled
+    with _mp_lock:
+        if not _mp_disabled:
+            _mp_disabled = True
+            print("[clip/local] MediaPipe disabled after runtime error", flush=True)
+
+
+def _is_mediapipe_disabled() -> bool:
+    with _mp_lock:
+        return _mp_disabled
+
+
+def _ratio(aspect_ratio: str) -> float:
+    try:
+        w, h = aspect_ratio.split(":")
+        return float(w) / float(h)
+    except (ValueError, ZeroDivisionError):
+        return 9.0 / 16.0
+
+
+def _crop_size(src_w: int, src_h: int, target_ratio: float) -> Tuple[int, int]:
+    if target_ratio < src_w / src_h:
+        crop_h = src_h
+        crop_w = int(crop_h * target_ratio)
+    else:
+        crop_w = src_w
+        crop_h = int(crop_w / target_ratio)
+    crop_w = max(2, crop_w - (crop_w % 2))
+    crop_h = max(2, crop_h - (crop_h % 2))
+    return crop_w, crop_h
+
+
+def _fit_ratio(crop_w: int, crop_h: int, target_ratio: float) -> Tuple[int, int]:
+    current_ratio = crop_w / float(max(crop_h, 1))
+    if current_ratio > target_ratio:
+        crop_w = int(crop_h * target_ratio)
+    else:
+        crop_h = int(crop_w / target_ratio)
+    crop_w = max(2, crop_w - (crop_w % 2))
+    crop_h = max(2, crop_h - (crop_h % 2))
+    return crop_w, crop_h
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _center_from_box(box: Tuple[float, float, float, float]) -> Tuple[float, float]:
+    x0, y0, x1, y1 = box
+    return ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+
+
+def _box_from_center(
+    center_x: float,
+    center_y: float,
+    crop_w: int,
+    crop_h: int,
+    src_w: int,
+    src_h: int,
+) -> Tuple[int, int, int, int]:
+    x0 = int(round(center_x - crop_w / 2.0))
+    y0 = int(round(center_y - crop_h / 2.0))
+    x0 = int(_clamp(x0, 0, max(0, src_w - crop_w)))
+    y0 = int(_clamp(y0, 0, max(0, src_h - crop_h)))
+    return x0, y0, x0 + crop_w, y0 + crop_h
+
+
+def _box_from_anchor(
+    anchor_x: float,
+    anchor_y: float,
+    crop_w: int,
+    crop_h: int,
+    src_w: int,
+    src_h: int,
+) -> Tuple[int, int, int, int]:
+    x0 = int(round(anchor_x - crop_w / 2.0))
+    y0 = int(round(anchor_y - crop_h / 2.0))
+    x0 = int(_clamp(x0, 0, max(0, src_w - crop_w)))
+    y0 = int(_clamp(y0, 0, max(0, src_h - crop_h)))
+    return x0, y0, x0 + crop_w, y0 + crop_h
+
+
+def _clamp_crop_origin(
+    crop_x: float,
+    crop_y: float,
+    crop_w: int,
+    crop_h: int,
+    src_w: int,
+    src_h: int,
+) -> Tuple[int, int]:
+    final_x = max(0, min(int(crop_x), max(0, src_w - crop_w)))
+    final_y = max(0, min(int(crop_y), max(0, src_h - crop_h)))
+    return final_x, final_y
+
+
+def _resize_for_inference(frame: np.ndarray) -> Tuple[np.ndarray, float]:
+    height, width = frame.shape[:2]
+    max_dim = max(height, width)
+    if max_dim <= CROP_INFERENCE_MAX_DIM:
+        return frame, 1.0
+
+    scale = CROP_INFERENCE_MAX_DIM / float(max_dim)
+    resized = cv2.resize(frame, (int(round(width * scale)), int(round(height * scale))), interpolation=cv2.INTER_AREA)
+    return resized, scale
+
+
+def _box_wh(box: Tuple[float, float, float, float]) -> Tuple[float, float]:
+    x0, y0, x1, y1 = box
+    return max(1.0, x1 - x0), max(1.0, y1 - y0)
+
+
+def _box_area(box: Tuple[float, float, float, float]) -> float:
+    w, h = _box_wh(box)
+    return w * h
+
+
+def _smooth_value(previous: Optional[float], current: float, alpha: float) -> float:
+    if previous is None:
+        return current
+    return previous + (current - previous) * alpha
+
+
+def _smooth_box(
+    previous: Optional[Tuple[int, int, int, int]],
+    current: Tuple[int, int, int, int],
+    alpha: float,
+) -> Tuple[int, int, int, int]:
+    if previous is None:
+        return current
+    return tuple(
+        int(round(_smooth_value(float(prev), float(cur), alpha)))
+        for prev, cur in zip(previous, current)
+    )  # type: ignore[return-value]
+
+
+def _active_segment(current_timestamp: float, srt_segments: Sequence[Dict]) -> Optional[Dict]:
+    for segment in srt_segments:
+        start = float(segment.get("start", 0.0) or 0.0)
+        end = float(segment.get("end", 0.0) or 0.0)
+        if start <= current_timestamp <= end:
+            return segment
+    return None
+
+
+def _segments_density(
+    current_timestamp: float,
+    srt_segments: Sequence[Dict],
+    window: float = 10.0,
+) -> int:
+    count = 0
+    for segment in srt_segments:
+        seg_start = float(segment.get("start", 0.0) or 0.0)
+        seg_end = float(segment.get("end", 0.0) or 0.0)
+        if seg_start <= current_timestamp <= seg_end:
+            count += 1
+        elif (current_timestamp - window) <= seg_end <= current_timestamp:
+            count += 1
+        elif current_timestamp <= seg_start <= (current_timestamp + window):
+            count += 1
+    return count
+
+
+def _speaking_rate(
+    current_timestamp: float,
+    srt_segments: Sequence[Dict],
+    window: float = 10.0,
+) -> float:
+    count = _segments_density(current_timestamp, srt_segments, window)
+    rate = count / max(window, 1e-6)
+    return max(0.0, min(rate, 5.0))
+
+
+def _dynamic_overlap_lock_seconds(
+    current_timestamp: float,
+    srt_segments: Sequence[Dict],
+    min_lock: float = 1.5,
+    max_lock: float = 4.0,
+    window: float = 10.0,
+) -> float:
+    rate = _speaking_rate(current_timestamp, srt_segments, window)
+    fast_threshold = 2.0
+    medium_threshold = 1.0
+    if rate >= fast_threshold:
+        lock = min_lock
+    elif rate >= medium_threshold:
+        fraction = (rate - medium_threshold) / (fast_threshold - medium_threshold)
+        lock = min_lock + fraction * (2.5 - min_lock)
+    else:
+        fraction = rate / medium_threshold
+        lock = 2.5 + fraction * (max_lock - 2.5)
+    return max(min_lock, min(lock, max_lock))
+
+
+def _active_segments(current_timestamp: float, srt_segments: Sequence[Dict]) -> List[Dict]:
+    active: List[Dict] = []
+    for segment in srt_segments:
+        start = float(segment.get("start", 0.0) or 0.0)
+        end = float(segment.get("end", 0.0) or 0.0)
+        if start <= current_timestamp <= end:
+            active.append(segment)
+    return active
+
+
+def _slice_segments_for_clip(
+    segments: Sequence[Dict],
+    clip_start: float,
+    clip_end: float,
+) -> List[Dict]:
+    clipped: List[Dict] = []
+    for segment in segments:
+        start = float(segment.get("start", 0.0) or 0.0)
+        end = float(segment.get("end", 0.0) or 0.0)
+        overlap_start = max(start, clip_start)
+        overlap_end = min(end, clip_end)
+        if overlap_end <= overlap_start:
+            continue
+        clipped.append(
+            {
+                "start": overlap_start - clip_start,
+                "end": overlap_end - clip_start,
+                "text": str(segment.get("text", "")).strip(),
+            }
+        )
+    return clipped
+
+
+def _motion_mask_center(gray_prev: np.ndarray, gray_curr: np.ndarray) -> Optional[Tuple[float, float]]:
+    diff = cv2.absdiff(gray_prev, gray_curr)
+    diff = cv2.GaussianBlur(diff, (7, 7), 0)
+    _, thresh = cv2.threshold(diff, 18, 255, cv2.THRESH_BINARY)
+    thresh = cv2.dilate(thresh, None, iterations=1)
+    moments = cv2.moments(thresh)
+    if moments["m00"] <= 0:
+        return None
+    return (moments["m10"] / moments["m00"], moments["m01"] / moments["m00"])
+
+
+def _get_yolo_model():
+    """Lazy-load YOLOv8n for podcast crop detection.
+
+    Returns None if the model cannot be loaded so callers can fall back safely.
+    Thread-safe via _yolo_lock.
+    """
+    cached = getattr(_get_yolo_model, "_cached", None)
+    if cached is not None:
+        return cached
+
+    with _yolo_lock:
+        cached = getattr(_get_yolo_model, "_cached", None)
+        if cached is not None:
+            return cached
+
+        try:
+            from ultralytics import YOLO  # type: ignore
+        except Exception as e:
+            print(f"[PODCAST WARN] ultralytics unavailable: {e}", flush=True)
+            return None
+
+        try:
+            model = YOLO("yolov8n.pt")
+        except Exception as e:
+            print(f"[PODCAST WARN] failed to load YOLOv8n: {e}", flush=True)
+            return None
+
+        cuda_device = _resolve_cuda_device()
+        if cuda_device is not None:
+            try:
+                model.to("cuda")
+                setattr(_get_yolo_model, "_device", cuda_device)
+                setattr(_get_yolo_model, "_half", True)
+                print("[PODCAST] YOLO using CUDA", flush=True)
+            except Exception as e:
+                print(f"[PODCAST WARN] failed to move YOLO to CUDA: {e}", flush=True)
+                setattr(_get_yolo_model, "_device", None)
+                setattr(_get_yolo_model, "_half", False)
         else:
-            self.locked_score = score
-            self.target_x, self.target_y = tx, ty
-            self.pending_id = None
-            self.pending_count = 0
+            setattr(_get_yolo_model, "_device", None)
+            setattr(_get_yolo_model, "_half", False)
 
-        if abs(self.target_x - self.x) <= self.deadzone_x and abs(self.target_y - self.y) <= self.deadzone_y:
-            return self.x, self.y
+        setattr(_get_yolo_model, "_cached", model)
+        return model
 
-        dist_x = abs(self.target_x - self.x)
-        dist_y = abs(self.target_y - self.y)
-        ax = self.alpha_min + (self.alpha_max - self.alpha_min) * min(dist_x / self.frame_width, 1.0)
-        self.x = ax * self.target_x + (1 - ax) * self.x
-        ay = self.alpha_min + (self.alpha_max - self.alpha_min) * min(dist_y / self.frame_height, 1.0)
-        self.y = ay * self.target_y + (1 - ay) * self.y
 
-        return self.x, self.y
+def _extract_tracks(frame: np.ndarray, model) -> List[Dict]:
+    device = getattr(_get_yolo_model, "_device", None)
+    half = bool(getattr(_get_yolo_model, "_half", False))
+    results = model.track(
+        frame,
+        persist=True,
+        tracker="bytetrack.yaml",
+        verbose=False,
+        classes=[0],
+        device=device,
+        half=half,
+    )
+    if not results:
+        return []
+
+    result = results[0]
+    boxes = getattr(result, "boxes", None)
+    if boxes is None or len(boxes) == 0:
+        return []
+
+    tracks: List[Dict] = []
+    for idx, box in enumerate(boxes):
+        xyxy = box.xyxy[0].tolist()
+        x0, y0, x1, y1 = [float(v) for v in xyxy]
+        track_id = idx
+        if getattr(box, "id", None) is not None:
+            try:
+                track_id = int(box.id.item())
+            except Exception:
+                try:
+                    track_id = int(box.id[0])
+                except Exception:
+                    track_id = idx
+
+        width = max(1.0, x1 - x0)
+        height = max(1.0, y1 - y0)
+        tracks.append(
+            {
+                "track_id": track_id,
+                "bbox": (x0, y0, x1, y1),
+                "center": ((x0 + x1) / 2.0, (y0 + y1) / 2.0),
+                "face_area": width * height,
+                "confidence": float(box.conf[0]) if getattr(box, "conf", None) is not None else 0.0,
+            }
+        )
+
+    tracks.sort(key=lambda item: item["center"][0])
+    return tracks
+
+
+def _extract_tracks_scaled(frame: np.ndarray, model, scale: float) -> List[Dict]:
+    tracks = _extract_tracks(frame, model)
+    if scale == 1.0:
+        return tracks
+
+    inv_scale = 1.0 / scale
+    scaled_tracks: List[Dict] = []
+    for track in tracks:
+        x0, y0, x1, y1 = track["bbox"]
+        scaled_bbox = (x0 * inv_scale, y0 * inv_scale, x1 * inv_scale, y1 * inv_scale)
+        scaled_tracks.append(
+            {
+                **track,
+                "bbox": scaled_bbox,
+                "center": _center_from_box(scaled_bbox),
+                "face_area": _box_area(scaled_bbox),
+            }
+        )
+    return scaled_tracks
+
+
+def get_stable_podcast_crop(
+    frame: np.ndarray,
+    current_timestamp: float,
+    srt_segments: Sequence[Dict],
+    prev_state: Optional[Dict],
+    debug: bool = False,
+) -> Tuple[Optional[Tuple[int, int, int, int]], Dict]:
+    """Return a stable crop box and next state for podcast videos.
+
+    The function prefers:
+      1. locked_id if still present,
+      2. SRT-aligned active speaker with motion in lower face area,
+      3. largest tracked person,
+      4. None to trigger center-crop fallback.
+    """
+    state = dict(prev_state or {})
+    src_h, src_w = frame.shape[:2]
+    target_ratio = _ratio("9:16")
+    crop_w, crop_h = _fit_ratio(*_crop_size(src_w, src_h, target_ratio), target_ratio)
+    inference_frame, scale = _resize_for_inference(frame)
+
+    model = _get_yolo_model()
+    if model is None:
+        return None, state
+
+    try:
+        tracks = _extract_tracks_scaled(inference_frame, model, scale)
+    except Exception as e:
+        print(f"[PODCAST WARN] YOLO tracking failed: {e}", flush=True)
+        return None, state
+
+    now_segment = _active_segment(current_timestamp, srt_segments)
+    speech_active = now_segment is not None
+
+    prev_gray = state.get("prev_gray")
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    state["prev_gray"] = gray
+
+    locked_id = state.get("locked_id")
+    locked_box = state.get("last_box")
+    locked_ts = float(state.get("locked_ts", -1.0) or -1.0)
+    last_seen_ts = float(state.get("last_seen_ts", -1.0) or -1.0)
+    overlap_lock_until = float(state.get("overlap_lock_until", 0.0) or 0.0)
+    pending_track_id = state.get("pending_track_id")
+    pending_since = float(state.get("pending_since", -1.0) or -1.0)
+    smooth_crop_x = state.get("smooth_crop_x")
+    smooth_crop_y = state.get("smooth_crop_y")
+    last_debug_log_ts = float(state.get("last_debug_log_ts", -1.0) or -1.0)
+
+    def lower_face_motion_score(track: Dict) -> float:
+        x0, y0, x1, y1 = [int(v) for v in track["bbox"]]
+        h = max(1, y1 - y0)
+        lower_start = y0 + int(h * 0.60)
+        roi = gray[lower_start:y1, x0:x1]
+        if roi.size == 0 or prev_gray is None:
+            return 0.0
+        prev_roi = prev_gray[lower_start:y1, x0:x1]
+        if prev_roi.size == 0:
+            return 0.0
+        diff = cv2.absdiff(prev_roi, roi)
+        return float(np.mean(diff))
+
+    def mouth_motion_score(track: Dict) -> float:
+        x0, y0, x1, y1 = [int(v) for v in track["bbox"]]
+        w = max(1, x1 - x0)
+        h = max(1, y1 - y0)
+        mouth_top = y0 + int(h * 0.60)
+        mouth_bottom = y0 + int(h * 0.88)
+        mouth_left = x0 + int(w * 0.25)
+        mouth_right = x0 + int(w * 0.75)
+        roi = gray[mouth_top:mouth_bottom, mouth_left:mouth_right]
+        if roi.size == 0 or prev_gray is None:
+            return 0.0
+        prev_roi = prev_gray[mouth_top:mouth_bottom, mouth_left:mouth_right]
+        if prev_roi.size == 0:
+            return 0.0
+        diff = cv2.absdiff(prev_roi, roi)
+        return float(np.mean(diff))
+
+    def motion_score_person(track: Dict) -> float:
+        return mouth_motion_score(track)
+
+    def torso_anchor(track: Dict) -> Tuple[float, float]:
+        """Use a stable anchor near the upper torso.
+
+        Keeping the anchor near the visual center of the person prevents
+        the speaker from being cropped too low or cut in half.
+        """
+        x0, y0, x1, y1 = [float(v) for v in track["bbox"]]
+        w = max(1.0, x1 - x0)
+        h = max(1.0, y1 - y0)
+        anchor_x = x0 + (w / 2.0)
+        anchor_y = y0 + (h * 0.42)
+
+        prev_anchor_y = state.get("anchor_y_smoothed")
+        anchor_y = _smooth_value(float(prev_anchor_y) if prev_anchor_y is not None else None, anchor_y, 0.06)
+        state["anchor_y_smoothed"] = anchor_y
+        return anchor_x, anchor_y
+
+    def target_crop_origin(track: Dict) -> Tuple[float, float]:
+        anchor_x, anchor_y = torso_anchor(track)
+        target_x = anchor_x - (crop_w / 2.0)
+        target_y = anchor_y - (crop_h / 2.0)
+        return target_x, target_y
+
+    def normalize_box(box: Tuple[float, float, float, float]) -> Optional[Tuple[int, int, int, int]]:
+        x1, y1, x2, y2 = [int(round(v)) for v in box]
+        x1 = max(0, min(x1, src_w))
+        y1 = max(0, min(y1, src_h))
+        x2 = max(0, min(x2, src_w))
+        y2 = max(0, min(y2, src_h))
+        w = x2 - x1
+        h = y2 - y1
+        if w < 100 or h < 100:
+            return None
+        return (x1, y1, x2, y2)
+
+    def center_distance_score(track: Dict) -> float:
+        cx, cy = track["center"]
+        return 1.0 - min(hypot(cx - (src_w / 2.0), cy - (src_h / 2.0)) / hypot(src_w, src_h), 1.0)
+
+    def speaker_score(track: Dict) -> float:
+        score = 0.0
+        if speech_active:
+            score += 0.55
+        score += 0.25 * center_distance_score(track)
+        score += 0.20 * min(track["face_area"] / float(src_w * src_h), 0.25) / 0.25
+        score += min(mouth_motion_score(track) / 22.0, 1.0) * 0.35
+        return score
+
+    motion_scores = {int(t["track_id"]): motion_score_person(t) for t in tracks}
+    should_log_debug = debug and (
+        last_debug_log_ts < 0.0 or (current_timestamp - last_debug_log_ts) >= 1.0
+    )
+    if should_log_debug:
+        print(f"[DEBUG] Timestamp: {current_timestamp}s", flush=True)
+        print(f"[DEBUG] Active SRT segment: {now_segment}", flush=True)
+        print(f"[DEBUG] Tracked persons: {[int(t['track_id']) for t in tracks]}", flush=True)
+        print(f"[DEBUG] Locked ID: {locked_id}", flush=True)
+        print(f"[DEBUG] Motion score person 1: {motion_scores.get(1, 0.0)}", flush=True)
+        print(f"[DEBUG] Motion score person 2: {motion_scores.get(2, 0.0)}", flush=True)
+        state["last_debug_log_ts"] = current_timestamp
+
+    active_segments = _active_segments(current_timestamp, srt_segments)
+    overlap_detected = len(active_segments) > 1
+    if overlap_detected:
+        print(f"[OVERLAP] {len(active_segments)} speakers active. Locked ID: {locked_id}", flush=True)
+    if overlap_lock_until <= current_timestamp:
+        lock_seconds = _dynamic_overlap_lock_seconds(current_timestamp, srt_segments or [])
+        log_note = "fast" if lock_seconds <= 1.6 else "medium" if lock_seconds <= 2.5 else "slow"
+        print(f"[OVERLAP] dynamic lock = {lock_seconds:.1f}s ({log_note})", flush=True)
+        overlap_lock_until = current_timestamp + lock_seconds
+    state["overlap_lock_until"] = overlap_lock_until
+
+    track_by_id = {int(t["track_id"]): t for t in tracks}
+
+    def pick_overlap_candidate() -> Optional[Dict]:
+        if not tracks:
+            return None
+        longest_seg = max(active_segments, key=lambda s: float(s.get("end", 0.0) or 0.0) - float(s.get("start", 0.0) or 0.0)) if active_segments else None
+        if longest_seg is not None:
+            print(f"[OVERLAP] longest active segment: {longest_seg}", flush=True)
+        scored = sorted(
+            tracks,
+            key=lambda t: (
+                t["face_area"],
+                motion_score_person(t),
+                center_distance_score(t),
+            ),
+            reverse=True,
+        )
+        return scored[0] if scored else None
+
+    if locked_id is not None and locked_id in track_by_id and now_segment is None and not overlap_detected:
+        chosen = track_by_id[locked_id]
+        state["last_seen_ts"] = current_timestamp
+        box = normalize_box(tuple(chosen["bbox"]))
+        if box is None:
+            return None, state
+        state["last_box"] = box
+        state["locked_ts"] = current_timestamp
+        if debug or should_log_debug:
+            print(f"[DEBUG] Final crop box: {box}", flush=True)
+        return state["last_box"], state
+
+    if overlap_detected and locked_id is not None and locked_id in track_by_id and current_timestamp < overlap_lock_until:
+        chosen = track_by_id[locked_id]
+        state["last_seen_ts"] = current_timestamp
+        box = normalize_box(tuple(chosen["bbox"]))
+        if box is None:
+            return None, state
+        state["last_box"] = box
+        state["locked_ts"] = current_timestamp
+        state["pending_track_id"] = None
+        state["pending_since"] = -1.0
+        if debug or should_log_debug:
+            print(f"[DEBUG] Final crop box: {box}", flush=True)
+        return state["last_box"], state
+
+    candidate: Optional[Dict] = None
+    if overlap_detected:
+        candidate = pick_overlap_candidate()
+    elif now_segment is not None and tracks:
+        scored = sorted(tracks, key=speaker_score, reverse=True)
+        candidate = scored[0]
+        for t in scored:
+            if motion_score_person(t) > 6.0:
+                candidate = t
+                break
+
+    if candidate is None and tracks:
+        candidate = max(tracks, key=lambda t: t["face_area"])
+
+    if candidate is None and locked_id is not None and locked_id in track_by_id:
+        candidate = track_by_id[locked_id]
+
+    if candidate is None:
+        state["locked_id"] = None
+        state["pending_track_id"] = None
+        state["pending_since"] = -1.0
+        return None, state
+
+    candidate_id = int(candidate["track_id"])
+    box = normalize_box(tuple(candidate["bbox"]))
+    if box is None:
+        return None, state
+    if locked_box is not None:
+        box = _smooth_box(locked_box, box, 0.22)
+
+    state["locked_id"] = candidate_id
+    state["locked_ts"] = current_timestamp
+    state["last_seen_ts"] = current_timestamp
+    state["last_box"] = box
+    state["pending_track_id"] = None
+    state["pending_since"] = -1.0
+
+    target_crop_x, target_crop_y = target_crop_origin(candidate)
+    current_crop_x = float(smooth_crop_x if smooth_crop_x is not None else target_crop_x)
+    current_crop_y = float(smooth_crop_y if smooth_crop_y is not None else target_crop_y)
+    current_crop_x += (target_crop_x - current_crop_x) * 0.16
+    current_crop_y += (target_crop_y - current_crop_y) * 0.16
+    final_x, final_y = _clamp_crop_origin(current_crop_x, current_crop_y, crop_w, crop_h, src_w, src_h)
+    state["smooth_crop_x"] = float(current_crop_x)
+    state["smooth_crop_y"] = float(current_crop_y)
+    state["final_crop_x"] = final_x
+    state["final_crop_y"] = final_y
+
+    if debug or should_log_debug:
+        print(f"[DEBUG] Final crop box: {box}", flush=True)
+    return box, state
+
+
+def _cut_subclip(source_path: str, start: float, end: float, out_path: str) -> str:
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        source_path,
+        "-ss",
+        f"{start:.3f}",
+        "-to",
+        f"{end:.3f}",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "fast",
+        "-crf",
+        "20",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        out_path,
+    ]
+    subprocess.run(cmd, check=True)
+    return out_path
+
+
+def _open_video_capture(path: str, retries: int = 8, delay_seconds: float = 0.25) -> cv2.VideoCapture:
+    """Open a video file with a small retry window for freshly written outputs."""
+    for attempt in range(retries):
+        cap = cv2.VideoCapture(path)
+        if cap.isOpened():
+            return cap
+        cap.release()
+        if attempt < retries - 1:
+            import time
+
+            time.sleep(delay_seconds)
+    raise RuntimeError(f"could not open {path}")
+
+
+def _transcode_to_decodeable_mp4(source_path: str) -> str:
+    """Create a temporary H.264/AAC copy that OpenCV can reliably decode.
+
+    This is a best-effort compatibility shim for inputs like AV1/WebM/MKV that
+    may not decode through the local OpenCV build even when ffmpeg itself can
+    read them.
+    """
+    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    tmp_file.close()
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        source_path,
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "20",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        tmp_file.name,
+    ]
+    try:
+        subprocess.run(cmd, check=True)
+    except Exception:
+        try:
+            os.remove(tmp_file.name)
+        except OSError:
+            pass
+        raise
+    return tmp_file.name
+
+
+def _prepare_decodeable_input(path: str) -> Tuple[str, bool]:
+    """Return a decodeable path, transcoding to temp mp4 if needed."""
+    cap = None
+    try:
+        cap = _open_video_capture(path)
+    except Exception:
+        print(f"[clip/local] source is not decodeable by OpenCV, transcoding: {path}", flush=True)
+        temp_path = _transcode_to_decodeable_mp4(path)
+        cap = _open_video_capture(temp_path)
+        cap.release()
+        return temp_path, True
+
+    try:
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if width <= 0 or height <= 0:
+            raise RuntimeError("OpenCV reported invalid frame dimensions")
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            raise RuntimeError("OpenCV could not read first frame")
+        return path, False
+    except Exception:
+        print(f"[clip/local] source opened but looks invalid, transcoding: {path}", flush=True)
+        temp_path = _transcode_to_decodeable_mp4(path)
+        cap.release()
+        try:
+            cap = _open_video_capture(temp_path)
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                raise RuntimeError("transcoded video still not readable")
+            cap.release()
+        except Exception:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+            raise
+        return temp_path, True
+    finally:
+        if cap is not None:
+            cap.release()
+
+
+def extract_audio_energy_array(video_path: str, fps: float) -> List[float]:
+    try:
+        import librosa  # type: ignore
+    except ImportError as e:
+        raise RuntimeError(
+            "librosa is required for local cropping. Install it with:\n"
+            "    pip install -r requirements-local.txt"
+        ) from e
+
+    try:
+        try:
+            y, sr = librosa.load(video_path, sr=16000, mono=True, backend="soundfile")
+        except TypeError:
+            y, sr = librosa.load(video_path, sr=16000, mono=True)
+    except Exception as e:
+        raise RuntimeError(f"failed to load audio from {video_path}: {e}") from e
+
+    if y.size == 0:
+        return []
+
+    hop_length = max(1, int(sr / max(fps, 1.0)))
+    frame_length = max(hop_length * 2, 2048)
+    rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
+    times = librosa.frames_to_time(range(len(rms)), sr=sr, hop_length=hop_length)
+
+    energy_by_timestamp = list(zip(times.tolist(), rms.tolist()))
+    if not energy_by_timestamp:
+        return []
+
+    duration = len(y) / float(sr)
+    total_frames = max(1, int(duration * fps) + 1)
+    energy_by_frame: List[float] = []
+    cursor = 0
+    for frame_index in range(total_frames):
+        timestamp = frame_index / float(fps)
+        while cursor + 1 < len(energy_by_timestamp) and energy_by_timestamp[cursor + 1][0] <= timestamp:
+            cursor += 1
+        energy_by_frame.append(float(energy_by_timestamp[cursor][1]))
+
+    max_energy = max(energy_by_frame) if energy_by_frame else 0.0
+    if max_energy > 0:
+        energy_by_frame = [value / max_energy for value in energy_by_frame]
+    return energy_by_frame
+
+
+def _load_legacy_fallback() -> None:
+    """Placeholder to keep legacy path isolated in the same file.
+
+    The legacy crop pipeline below remains unchanged in behavior.
+    """
+
+
+def _reframe_vertical(
+    in_path: str,
+    out_path: str,
+    aspect_ratio: str,
+    debug: bool = False,
+    srt_segments: Optional[Sequence[Dict]] = None,
+    start_time: float = 0.0,
+    end_time: Optional[float] = None,
+) -> str:
+    """Legacy crop path.
+
+    This is intentionally left as the safe fallback path.
+    """
+    target_ratio = _ratio(aspect_ratio)
+    decode_path, should_cleanup_decode_path = _prepare_decodeable_input(in_path)
+    cap = _open_video_capture(decode_path)
+
+    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    audio_energy = extract_audio_energy_array(decode_path, fps)
+    start_frame = max(0, int(round(start_time * fps)))
+    end_frame = max(start_frame, int(round(end_time * fps))) if end_time is not None else None
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+    crop_w, crop_h = _fit_ratio(*_crop_size(src_w, src_h, target_ratio), target_ratio)
+    mp = None
+    pose = None
+    face_mesh = None
+    if not _is_mediapipe_disabled():
+        try:
+            import mediapipe as mp  # type: ignore
+
+            pose = mp.solutions.pose.Pose(
+                static_image_mode=False,
+                model_complexity=1,
+                smooth_landmarks=True,
+                enable_segmentation=False,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+            face_mesh = mp.solutions.face_mesh.FaceMesh(
+                static_image_mode=False,
+                max_num_faces=5,
+                refine_landmarks=True,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+        except Exception:
+            mp = None
+            pose = None
+            face_mesh = None
+            _mark_mediapipe_failed()
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+
+    silent_path = out_path + ".silent.mp4"
+    debug_path = os.path.join(os.path.dirname(out_path), "output_debug.mp4") if debug else None
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(silent_path, fourcc, fps, (crop_w, crop_h))
+    debug_writer = cv2.VideoWriter(debug_path, fourcc, fps, (src_w, src_h)) if debug_path else None
+    source_duration = (cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) / max(fps, 1.0)
+
+    last_center: Optional[Tuple[int, int]] = None
+    smoothing = 0.18
+
+    locked_face_id: Optional[int] = None
+    lock_streak: int = 0
+    locked_score: float = 0.0
+    SUBJECT_HYSTERESIS = 0.15
+    SUBJECT_LOCK_FRAMES = 14
+
+    def _best_subject(frame, face_data, pose_data, audio_energy_arr, frame_index: int) -> Dict:
+        nonlocal locked_face_id, lock_streak, locked_score
+        frame_h, frame_w = frame.shape[:2]
+        energy = 0.0
+        if audio_energy_arr is not None:
+            try:
+                energy = float(audio_energy_arr[min(frame_index, len(audio_energy_arr) - 1)])
+            except (TypeError, ValueError, IndexError):
+                energy = 0.0
+
+        audio_high = energy > 0.1
+        pose_center = None
+        pose_stability = 0.0
+        if pose_data:
+            pose_center = pose_data.get("pose_center")
+            pose_stability = float(pose_data.get("pose_stability", 0.0) or 0.0)
+
+        best_candidate: Optional[Dict] = None
+        best_score = -1.0
+        locked_candidate: Optional[Dict] = None
+        for face in face_data or []:
+            face_center = face.get("face_center")
+            if not face_center:
+                continue
+
+            face_area = int(face.get("face_area", 1) or 1)
+            mouth_openness_variance = float(face.get("mouth_openness_variance", 0.0) or 0.0)
+            mouth_motion_score = min(mouth_openness_variance / 0.01, 1.0)
+
+            center_x = frame_w / 2.0
+            center_y = frame_h / 2.0
+            distance_from_center = hypot(face_center[0] - center_x, face_center[1] - center_y)
+            face_center_score = 1.0 - min(distance_from_center / hypot(frame_w, frame_h), 1.0)
+
+            pose_alignment_score = 0.0
+            if pose_center is not None:
+                pose_distance = hypot(face_center[0] - pose_center[0], face_center[1] - pose_center[1])
+                pose_alignment_score = 1.0 - min(pose_distance / hypot(frame_w, frame_h), 1.0)
+
+            face_size_score = min(face_area / float(frame_w * frame_h), 0.18) / 0.18
+
+            reaction_score = float(face.get("reaction_score", 0.0) or 0.0)
+            reaction_bonus = 1.0 + (0.40 * reaction_score)
+
+            if audio_high:
+                activity = (0.70 * mouth_motion_score) + (0.30 * face_center_score) + (0.15 * reaction_score)
+            else:
+                silent_activity = (0.50 * pose_stability) + (0.30 * face_center_score) + (0.20 * pose_alignment_score)
+                reaction_component = max(silent_activity, 0.58 * reaction_score)
+                activity = reaction_component + (0.10 * reaction_score)
+
+            base_score = (0.25 * face_center_score) + (0.20 * face_size_score) + (0.20 * pose_alignment_score)
+
+            if audio_high:
+                score = (base_score + activity) * reaction_bonus
+            else:
+                score = base_score + activity
+
+            candidate: Dict = {
+                "face_id": face.get("face_id"),
+                "face_center": face_center,
+                "face_area": face_area,
+                "mouth_openness_variance": mouth_openness_variance,
+                "mouth_motion_score": mouth_motion_score,
+                "face_center_score": face_center_score,
+                "pose_alignment_score": pose_alignment_score,
+                "pose_stability": pose_stability,
+                "audio_energy": energy,
+                "score": score,
+            }
+
+            if score > best_score:
+                best_score = score
+                best_candidate = candidate
+            if locked_face_id is not None and face.get("face_id") == locked_face_id:
+                locked_candidate = candidate
+
+        if best_candidate is None:
+            locked_face_id = None
+            lock_streak = 0
+            locked_score = 0.0
+            fallback_center = pose_center if pose_center is not None else (frame_w // 2, frame_h // 2)
+            return {
+                "face_id": None,
+                "face_center": fallback_center,
+                "face_area": 1,
+                "mouth_openness_variance": 0.0,
+                "mouth_motion_score": 0.0,
+                "face_center_score": 0.0,
+                "pose_alignment_score": 0.0,
+                "pose_stability": pose_stability,
+                "audio_energy": energy,
+                "score": 0.0,
+            }
+
+        best_id = best_candidate["face_id"]
+        best_score_val = best_score
+
+        if locked_face_id is None:
+            locked_face_id = best_id
+            locked_score = best_score_val
+            lock_streak = SUBJECT_LOCK_FRAMES
+        elif best_id == locked_face_id:
+            lock_streak = min(lock_streak + 1, SUBJECT_LOCK_FRAMES + 5)
+            locked_score = locked_score * 0.85 + best_score_val * 0.15
+        elif locked_candidate is not None:
+            lock_streak = max(lock_streak - 1, 0)
+            if best_score_val > locked_score * (1.0 + SUBJECT_HYSTERESIS):
+                lock_streak = max(lock_streak - 1, 0)
+            if lock_streak <= 0:
+                locked_face_id = best_id
+                locked_score = best_score_val
+                lock_streak = SUBJECT_LOCK_FRAMES
+                best_candidate["face_id"] = best_id
+                return best_candidate
+            return locked_candidate
+        else:
+            locked_face_id = best_id
+            locked_score = best_score_val
+            lock_streak = SUBJECT_LOCK_FRAMES
+
+        best_candidate["face_id"] = best_id
+        return best_candidate
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            frame_index = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+            if end_frame is not None and frame_index > end_frame:
+                break
+            if CROP_FRAME_STRIDE > 1 and frame_index % CROP_FRAME_STRIDE != 0:
+                if last_center is None:
+                    last_center = (src_w // 2, src_h // 2)
+                cx, cy = last_center
+                x0 = max(0, min(src_w - crop_w, cx - crop_w // 2))
+                y0 = max(0, min(src_h - crop_h, cy - crop_h // 2))
+                cropped = frame[y0 : y0 + crop_h, x0 : x0 + crop_w]
+                writer.write(cropped)
+                if debug and debug_writer is not None:
+                    debug_writer.write(frame)
+                continue
+
+            selected_subject = None
+            inference_frame, scale = _resize_for_inference(frame)
+            if pose is not None and face_mesh is not None and mp is not None:
+                rgb = cv2.cvtColor(inference_frame, cv2.COLOR_BGR2RGB)
+                try:
+                    pose_result = pose.process(rgb)
+                    face_result = face_mesh.process(rgb)
+                    pose_center = None
+                    if pose_result.pose_landmarks:
+                        landmarks = pose_result.pose_landmarks
+                        h, w = inference_frame.shape[:2]
+                        candidates: List[Tuple[Tuple[int, int], float]] = []
+                        for landmark, weight in (
+                            (mp.solutions.pose.PoseLandmark.NOSE, 3.0),
+                            (mp.solutions.pose.PoseLandmark.LEFT_SHOULDER, 2.0),
+                            (mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER, 2.0),
+                            (mp.solutions.pose.PoseLandmark.LEFT_HIP, 1.5),
+                            (mp.solutions.pose.PoseLandmark.RIGHT_HIP, 1.5),
+                        ):
+                            lm = landmarks.landmark[landmark]
+                            if lm.visibility < 0.45:
+                                continue
+                            candidates.append(((int(lm.x * w), int(lm.y * h)), weight))
+                        if candidates:
+                            total = sum(weight for _, weight in candidates)
+                            pose_center = (
+                                int(sum(point[0] * weight for point, weight in candidates) / total),
+                                int(sum(point[1] * weight for point, weight in candidates) / total),
+                            )
+                    face_data: List[Dict] = []
+                    if face_result.multi_face_landmarks:
+                        for idx, face_landmarks in enumerate(face_result.multi_face_landmarks):
+                            xs = [lm.x for lm in face_landmarks.landmark]
+                            ys = [lm.y for lm in face_landmarks.landmark]
+                            x0 = max(0, int(min(xs) * inference_frame.shape[1]))
+                            y0 = max(0, int(min(ys) * inference_frame.shape[0]))
+                            x1 = min(inference_frame.shape[1], int(max(xs) * inference_frame.shape[1]))
+                            y1 = min(inference_frame.shape[0], int(max(ys) * inference_frame.shape[0]))
+                            face_area = max(1, (x1 - x0) * (y1 - y0))
+                            face_center = ((x0 + x1) // 2, (y0 + y1) // 2)
+                            top = face_landmarks.landmark[13]
+                            bottom = face_landmarks.landmark[14]
+                            mouth_variance = float(hypot(top.x - bottom.x, top.y - bottom.y))
+                            lm = face_landmarks.landmark
+                            left_eye_open = hypot(
+                                lm[159].x - lm[145].x, lm[159].y - lm[145].y
+                            )
+                            right_eye_open = hypot(
+                                lm[386].x - lm[374].x, lm[386].y - lm[374].y
+                            )
+                            eye_openness = (left_eye_open + right_eye_open) / 2.0
+                            mouth_width = hypot(
+                                lm[61].x - lm[291].x, lm[61].y - lm[291].y
+                            )
+                            reaction_score = max(
+                                min(eye_openness / 0.04, 1.0),
+                                min(mouth_variance / 0.06, 1.0),
+                                min(mouth_width / 0.18, 1.0),
+                            )
+                            face_data.append(
+                                {
+                                    "face_id": idx,
+                                    "face_center": (int(face_center[0] / scale), int(face_center[1] / scale)),
+                                    "face_area": int(face_area / (scale * scale)) if scale > 0 else face_area,
+                                    "mouth_openness_variance": mouth_variance,
+                                    "reaction_score": reaction_score,
+                                }
+                            )
+                    pose_data = None
+                    if pose_center is not None:
+                        pose_data = {
+                            "pose_center": (int(pose_center[0] / scale), int(pose_center[1] / scale)),
+                            "pose_stability": 1.0,
+                        }
+                    selected_subject = _best_subject(frame, face_data, pose_data, audio_energy, frame_index)
+                except Exception:
+                    _mark_mediapipe_failed()
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
+                    next_center = None
+                    if len(faces) > 0:
+                        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+                        next_center = (x + w // 2, y + h // 2)
+                    if next_center is None:
+                        next_center = (src_w // 2, src_h // 2)
+
+                    if last_center is None:
+                        last_center = next_center
+                    else:
+                        lx, ly = last_center
+                        cx, cy = next_center
+                        last_center = (
+                            int(lx + (cx - lx) * smoothing),
+                            int(ly + (cy - ly) * smoothing),
+                        )
+                    cx, cy = last_center
+                    x0 = max(0, min(src_w - crop_w, cx - crop_w // 2))
+                    y0 = max(0, min(src_h - crop_h, cy - crop_h // 2))
+                    cropped = frame[y0 : y0 + crop_h, x0 : x0 + crop_w]
+                    writer.write(cropped)
+                    if debug and debug_writer is not None:
+                        debug_writer.write(frame)
+                    continue
+            else:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
+                next_center = None
+                if len(faces) > 0:
+                    x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+                    next_center = (x + w // 2, y + h // 2)
+                if next_center is None:
+                    next_center = (src_w // 2, src_h // 2)
+
+                if last_center is None:
+                    last_center = next_center
+                else:
+                    lx, ly = last_center
+                    cx, cy = next_center
+                    last_center = (
+                        int(lx + (cx - lx) * smoothing),
+                        int(ly + (cy - ly) * smoothing),
+                    )
+                cx, cy = last_center
+                x0 = max(0, min(src_w - crop_w, cx - crop_w // 2))
+                y0 = max(0, min(src_h - crop_h, cy - crop_h // 2))
+                cropped = frame[y0 : y0 + crop_h, x0 : x0 + crop_w]
+                writer.write(cropped)
+                if debug and debug_writer is not None:
+                    debug_writer.write(frame)
+                continue
+
+            next_center: Optional[Tuple[int, int]] = None
+            if selected_subject and selected_subject.get("face_center"):
+                next_center = selected_subject["face_center"]
+
+            if next_center is not None:
+                if last_center is None:
+                    last_center = next_center
+                else:
+                    lx, ly = last_center
+                    cx, cy = next_center
+                    last_center = (
+                        int(lx + (cx - lx) * smoothing),
+                        int(ly + (cy - ly) * smoothing),
+                    )
+            if last_center is None:
+                last_center = (src_w // 2, src_h // 2)
+
+            cx, cy = last_center
+            x0 = max(0, min(src_w - crop_w, cx - crop_w // 2))
+            y0 = max(0, min(src_h - crop_h, cy - crop_h // 2))
+            cropped = frame[y0 : y0 + crop_h, x0 : x0 + crop_w]
+            writer.write(cropped)
+
+            if debug and debug_writer is not None:
+                overlay = frame.copy()
+                if selected_subject and selected_subject.get("face_center"):
+                    fx, fy = selected_subject["face_center"]
+                    box_w = 160
+                    box_h = 200
+                    cv2.rectangle(
+                        overlay,
+                        (max(0, fx - box_w // 2), max(0, fy - box_h // 2)),
+                        (min(src_w - 1, fx + box_w // 2), min(src_h - 1, fy + box_h // 2)),
+                        (0, 255, 0),
+                        3,
+                    )
+
+                score_text = f"Score: {selected_subject.get('score', 0.0):.3f}" if selected_subject else "Score: 0.000"
+                energy_text = f"Audio Energy: {selected_subject.get('audio_energy', 0.0):.3f}" if selected_subject else "Audio Energy: 0.000"
+                mouth_text = f"Mouth Variance: {selected_subject.get('mouth_openness_variance', 0.0):.5f}" if selected_subject else "Mouth Variance: 0.00000"
+                cv2.putText(overlay, score_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                cv2.putText(overlay, energy_text, (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                cv2.putText(overlay, mouth_text, (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                debug_writer.write(overlay)
+    finally:
+        cap.release()
+        if pose is not None:
+            pose.close()
+        if face_mesh is not None:
+            face_mesh.close()
+        writer.release()
+        if debug_writer is not None:
+            debug_writer.release()
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        silent_path,
+        "-ss",
+        f"{start_time:.3f}",
+        "-to",
+        f"{end_time:.3f}" if end_time is not None else f"{source_duration:.3f}",
+        "-i",
+        in_path,
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0?",
+        "-shortest",
+        out_path,
+    ]
+    subprocess.run(cmd, check=True)
+    if os.path.exists(silent_path):
+        os.remove(silent_path)
+    if should_cleanup_decode_path:
+        try:
+            os.remove(decode_path)
+        except OSError:
+            pass
+    return out_path
+
+
+def _reframe_vertical_podcast(
+    in_path: str,
+    out_path: str,
+    aspect_ratio: str,
+    debug: bool = False,
+    srt_segments: Optional[Sequence[Dict]] = None,
+    start_time: float = 0.0,
+    end_time: Optional[float] = None,
+) -> str:
+    """Podcast wrapper with YOLO + SRT-aware active speaker detection.
+
+    Falls back to legacy crop if YOLO fails to load or throws at runtime.
+    """
+    try:
+        from ultralytics import YOLO  # type: ignore  # noqa: F401
+    except Exception as e:
+        print(f"[PODCAST WARN] ultralytics unavailable ({e}). Using legacy crop.", flush=True)
+        return _reframe_vertical(
+            in_path,
+            out_path,
+            aspect_ratio,
+            debug=debug,
+            srt_segments=srt_segments,
+            start_time=start_time,
+            end_time=end_time,
+        )
+
+    try:
+        return _reframe_vertical_podcast_impl(
+            in_path,
+            out_path,
+            aspect_ratio,
+            debug=debug,
+            srt_segments=srt_segments,
+            start_time=start_time,
+            end_time=end_time,
+        )
+    except Exception as e:
+        print(f"[PODCAST WARN] YOLO pipeline failed ({e}). Using legacy crop.", flush=True)
+        return _reframe_vertical(
+            in_path,
+            out_path,
+            aspect_ratio,
+            debug=debug,
+            srt_segments=srt_segments,
+            start_time=start_time,
+            end_time=end_time,
+        )
+
+
+def _reframe_vertical_podcast_impl(
+    in_path: str,
+    out_path: str,
+    aspect_ratio: str,
+    debug: bool = False,
+    srt_segments: Optional[Sequence[Dict]] = None,
+    start_time: float = 0.0,
+    end_time: Optional[float] = None,
+) -> str:
+    try:
+        from ultralytics import YOLO  # type: ignore
+    except Exception as e:
+        raise RuntimeError(f"ultralytics import failed: {e}") from e
+
+    target_ratio = _ratio(aspect_ratio)
+    decode_path, should_cleanup_decode_path = _prepare_decodeable_input(in_path)
+    cap = _open_video_capture(decode_path)
+
+    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    crop_w, crop_h = _crop_size(src_w, src_h, target_ratio)
+    dead_zone_threshold = max(15.0, crop_w * 0.06)
+    start_frame = max(0, int(round(start_time * fps)))
+    end_frame = max(start_frame, int(round(end_time * fps))) if end_time is not None else None
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+    silent_path = out_path + ".silent.mp4"
+    debug_path = os.path.join(os.path.dirname(out_path), "output_debug.mp4") if debug else None
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(silent_path, fourcc, fps, (crop_w, crop_h))
+    debug_writer = cv2.VideoWriter(debug_path, fourcc, fps, (src_w, src_h)) if debug_path else None
+    source_duration = (cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) / max(fps, 1.0)
+
+    state: Dict = {}
+    prev_gray: Optional[np.ndarray] = None
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            frame_index = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+            if end_frame is not None and frame_index > end_frame:
+                break
+            if CROP_FRAME_STRIDE > 1 and frame_index % CROP_FRAME_STRIDE != 0:
+                x0 = int(state.get("final_crop_x", 0))
+                y0 = int(state.get("final_crop_y", 0))
+                x0 = max(0, min(x0, max(0, src_w - crop_w)))
+                y0 = max(0, min(y0, max(0, src_h - crop_h)))
+                x1 = x0 + crop_w
+                y1 = y0 + crop_h
+                cropped = frame[y0:y1, x0:x1]
+                if cropped.shape[0] != crop_h or cropped.shape[1] != crop_w:
+                    cropped = cv2.resize(cropped, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
+                writer.write(cropped)
+                if debug and debug_writer is not None:
+                    debug_writer.write(frame)
+                continue
+
+            current_timestamp = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0) / 1000.0
+            model = _get_yolo_model()
+            if model is None:
+                box, state = None, state
+            else:
+                box, state = get_stable_podcast_crop(frame, current_timestamp, srt_segments or [], {**state, "prev_gray": prev_gray}, debug=debug)
+            prev_gray = state.get("prev_gray")
+
+            if box is None:
+                x0, y0, x1, y1 = _box_from_center(src_w / 2.0, src_h / 2.0, crop_w, crop_h, src_w, src_h)
+            else:
+                x0 = int(state.get("final_crop_x", 0))
+                y0 = int(state.get("final_crop_y", 0))
+                x0 = max(0, min(x0, max(0, src_w - crop_w)))
+                y0 = max(0, min(y0, max(0, src_h - crop_h)))
+                x1 = x0 + crop_w
+                y1 = y0 + crop_h
+
+            cropped = frame[y0:y1, x0:x1]
+            if cropped.shape[0] != crop_h or cropped.shape[1] != crop_w:
+                cropped = cv2.resize(cropped, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
+            writer.write(cropped)
+
+            target_x = float(state.get("final_crop_x", x0))
+            target_y = float(state.get("final_crop_y", y0))
+            current_crop_x = float(x0)
+            current_crop_y = float(y0)
+            delta_x = target_x - current_crop_x
+            delta_y = target_y - current_crop_y
+
+            if abs(delta_x) > dead_zone_threshold:
+                current_crop_x += delta_x * 0.22
+            if abs(delta_y) > dead_zone_threshold:
+                current_crop_y += delta_y * 0.22
+
+            final_x, final_y = _clamp_crop_origin(current_crop_x, current_crop_y, crop_w, crop_h, src_w, src_h)
+            state["smooth_crop_x"] = float(current_crop_x)
+            state["smooth_crop_y"] = float(current_crop_y)
+            state["final_crop_x"] = final_x
+            state["final_crop_y"] = final_y
+
+            if debug and debug_writer is not None:
+                overlay = frame.copy()
+                cv2.rectangle(overlay, (x0, y0), (x1, y1), (0, 255, 0), 3)
+                cv2.putText(
+                    overlay,
+                    f"PODCAST ID: {state.get('locked_id', 'n/a')}",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 255, 0),
+                    2,
+                )
+                debug_writer.write(overlay)
+    finally:
+        cap.release()
+        writer.release()
+        if debug_writer is not None:
+            debug_writer.release()
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        silent_path,
+        "-ss",
+        f"{start_time:.3f}",
+        "-to",
+        f"{end_time:.3f}" if end_time is not None else f"{source_duration:.3f}",
+        "-i",
+        in_path,
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0?",
+        "-shortest",
+        out_path,
+    ]
+    subprocess.run(cmd, check=True)
+    if os.path.exists(silent_path):
+        os.remove(silent_path)
+    if should_cleanup_decode_path:
+        try:
+            os.remove(decode_path)
+        except OSError:
+            pass
+    return out_path
+
+
+def crop_clip_local(
+    source_path: str,
+    start_time: float,
+    end_time: float,
+    aspect_ratio: str,
+    out_path: str,
+    srt_segments: Optional[Sequence[Dict]] = None,
+    debug: bool = False,
+    podcast: bool = False,
+) -> str:
+    clip_segments = _slice_segments_for_clip(srt_segments or [], start_time, end_time)
+    if podcast:
+        _reframe_vertical_podcast(
+            source_path,
+            out_path,
+            aspect_ratio,
+            debug=debug,
+            srt_segments=clip_segments,
+            start_time=start_time,
+            end_time=end_time,
+        )
+    else:
+        _reframe_vertical(
+            source_path,
+            out_path,
+            aspect_ratio,
+            debug=debug,
+            srt_segments=clip_segments,
+            start_time=start_time,
+            end_time=end_time,
+        )
+    return out_path
+
+
+def crop_highlights_local(
+    source_path: str,
+    highlights: List[Dict],
+    aspect_ratio: str = "9:16",
+    out_dir: Optional[str] = None,
+    transcript: Optional[Dict] = None,
+    debug: bool = False,
+    podcast: bool = False,
+) -> List[Dict]:
+    out_dir = out_dir or LOCAL_OUTPUT_DIR
+    os.makedirs(out_dir, exist_ok=True)
+    transcript_segments = transcript.get("segments", []) if transcript else []
+    results: List[Dict] = [None] * len(highlights)  # type: ignore[list-item]
+
+    decode_path, should_cleanup_decode = _prepare_decodeable_input(source_path)
+    if should_cleanup_decode:
+        print(f"[clip/local] pre-transcoded source to H.264: {decode_path}", flush=True)
+
+    def _crop_one(index: int, highlight: Dict) -> Dict:
+        i = index + 1
+        out_path = os.path.join(out_dir, f"short_{i:02d}.mp4")
+        print(f"[clip/local] {i}/{len(highlights)}: {highlight.get('title', '(untitled)')}", flush=True)
+        try:
+            crop_clip_local(
+                decode_path,
+                float(highlight["start_time"]),
+                float(highlight["end_time"]),
+                aspect_ratio,
+                out_path,
+                srt_segments=transcript_segments,
+                debug=debug,
+                podcast=podcast,
+            )
+            return {**highlight, "clip_url": out_path}
+        except Exception as e:
+            print(f"[clip/local] {i} failed: {e}", flush=True)
+            return {**highlight, "clip_url": None, "error": str(e)}
+
+    try:
+        if podcast:
+            for index, highlight in enumerate(highlights):
+                results[index] = _crop_one(index, highlight)
+            return results
+
+        max_workers = min(len(highlights), max(1, (os.cpu_count() or 2) // 2))
+        if len(highlights) <= 1 or max_workers <= 1:
+            for index, highlight in enumerate(highlights):
+                results[index] = _crop_one(index, highlight)
+            return results
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_crop_one, index, highlight) for index, highlight in enumerate(highlights)]
+            for index, future in enumerate(futures):
+                results[index] = future.result()
+    finally:
+        if should_cleanup_decode:
+            try:
+                os.remove(decode_path)
+            except OSError:
+                pass
+
+    return results
