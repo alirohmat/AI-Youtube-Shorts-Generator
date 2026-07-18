@@ -1,12 +1,24 @@
 # AI YouTube Shorts Generator
 
-- Main entrypoint: `main.py`; public Python API: `shorts_generator.generate_shorts`.
-- API mode is default. It uses MuAPI for download, Whisper, highlight ranking, and autocrop.
-- Local mode is opt-in via `--mode local`; it needs `ffmpeg` on PATH plus `pip install -r requirements-local.txt`.
-- Local mode accepts YouTube URLs, `file://` URLs, or direct local file paths.
-- Local downloads cache as `output/source_<youtube_id>.*`; local transcripts cache as `output/<video_stem>.srt`.
-- The repo has no test suite or CI config. Validate changes with a focused CLI smoke run instead of inventing a broad test harness.
-- `shorts_generator/highlights.py` is the core prompt/selection logic; keep its JSON contract stable (`title`, `start_time`, `end_time`, `score`, `hook_sentence`, `virality_reason`).
-- `shorts_generator/local/clipper.py` is the heaviest file: podcast mode uses YOLOv8 + ByteTrack + MediaPipe/OpenCV fallbacks, so keep crop changes conservative.
-- `opencode.json` points OpenCode at the configured OpenAI-compatible gateway; do not change it unless the task is about OpenCode itself.
-- If you need a quick manual check, run one short clip generation with the smallest realistic input and inspect the printed result plus any written files.
+- Entrypoint: `main.py`; public API: `shorts_generator.generate_shorts`.
+- Modes: Default (API/MuAPI) vs `--mode local` (requires `ffmpeg` on PATH + `pip install -r requirements-local.txt`).
+- Inputs: YouTube URLs, `file://` URLs, or local file paths.
+- Caching: Local downloads as `output/source_<youtube_id>.*`; transcripts as `output/<video_stem>.srt`.
+- Validation: No test suite, linter, typechecker, or CI. Validate changes with CLI smoke run:
+  ```bash
+  python main.py <URL_OR_FILE_PATH> --mode local
+  ```
+
+## Core Components
+
+- `shorts_generator/highlights.py`: Core prompt/selection logic. JSON contract (`title`, `start_time`, `end_time`, `score`, `hook_sentence`, `virality_reason`) must remain stable. LLM usage pluggable (`call_muapi_llm` for API, `call_local_llm` for local).
+- `shorts_generator/local/clipper.py`: 1565 lines. Podcast mode uses YOLOv8 + ByteTrack + MediaPipe/OpenCV fallbacks. Keep crop changes minimal.
+
+## Architecture Gotchas
+
+- `highlights.py` mixes Indonesian and English in Tavily context prompts — intentional.
+- `config.py` loads `.env` at import via `python-dotenv`. Default `POLL_TIMEOUT_SECONDS` is 600 (trust code, not README).
+- Videos >30 min auto-chunked into 20-min windows with 60s overlap. Highlights offset-adjusted and globally deduped.
+- Local clipper fallback chain: MediaPipe Pose+FaceMesh → OpenCV Haar cascade → center crop. Podcast mode falls back to legacy path on YOLO failure.
+- `Pipeline._sanitize_highlight_timestamps` silently drops clips where `start >= end` after clamping. Check logs if clips disappear.
+- `generate_shorts()` return shape: `{mode, source_video_url, transcript, highlights, shorts}`. `clip_url` is hosted URL (API mode) or local path (local mode).
