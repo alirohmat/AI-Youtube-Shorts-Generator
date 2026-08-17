@@ -13,6 +13,7 @@ import os
 import subprocess
 import tempfile
 import threading
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from math import hypot
 from pathlib import Path
@@ -816,11 +817,16 @@ def extract_audio_energy_array(video_path: str, fps: float) -> List[float]:
     return energy_by_frame
 
 
-def _load_legacy_fallback() -> None:
-    """Placeholder to keep legacy path isolated in the same file.
-
-    The legacy crop pipeline below remains unchanged in behavior.
-    """
+def _ensure_yunet_model() -> str:
+    name = "face_detection_yunet_2023mar.onnx"
+    path = Path(__file__).parent / name
+    if not path.exists():
+        url = f"https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/{name}"
+        try:
+            urllib.request.urlretrieve(url, path)
+        except Exception as e:
+            raise RuntimeError(f"Gagal mengunduh YuNet: {e}")
+    return str(path)
 
 
 def _reframe_vertical(
@@ -876,7 +882,7 @@ def _reframe_vertical(
             pose = None
             face_mesh = None
             _mark_mediapipe_failed()
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+face_detector = cv2.FaceDetectorYN.create(_ensure_yunet_model(), "", (0, 0), score_threshold=0.9, nms_threshold=0.3, top_k=5000)
 
     silent_path = out_path + ".silent.mp4"
     debug_path = os.path.join(os.path.dirname(out_path), "output_debug.mp4") if debug else None
@@ -1116,11 +1122,17 @@ def _reframe_vertical(
                     selected_subject = _best_subject(frame, face_data, pose_data, audio_energy, frame_index)
                 except Exception:
                     _mark_mediapipe_failed()
-                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
-                    next_center = None
-                    if len(faces) > 0:
-                        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+                    h, w, _ = frame.shape
+                    face_detector.setInputSize((w, h))
+                    _, faces = face_detector.detect(frame)
+                    # faces is a 2D array with shape (n_faces, 15)
+                    # Each row represents a face with columns:
+                    # [x1, y1, w, h, right_eye_x, right_eye_y, left_eye_x, left_eye_y,
+                    # nose_x, nose_y, mouth_right_x, mouth_right_y, mouth_left_x,
+                    # mouth_left_y, score]
+                    if faces is not None and len(faces) > 0:
+                        # Find the largest face
+                        x, y, w, h = faces[0][:4].astype(int)
                         next_center = (x + w // 2, y + h // 2)
                     if next_center is None:
                         next_center = (src_w // 2, src_h // 2)
@@ -1142,15 +1154,17 @@ def _reframe_vertical(
                     if debug and debug_writer is not None:
                         debug_writer.write(frame)
                     continue
-            else:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
-                next_center = None
-                if len(faces) > 0:
-                    x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
-                    next_center = (x + w // 2, y + h // 2)
-                if next_center is None:
-                    next_center = (src_w // 2, src_h // 2)
+else:
+    h, w, _ = frame.shape
+    face_detector.setInputSize((w, h))
+    _, faces = face_detector.detect(frame)
+    next_center = None
+    if faces is not None and len(faces) > 0:
+        face = max(faces, key=lambda f: f[2] * f[3])
+        x, y, fw, fh = face[:4].astype(int)
+        next_center = (x + fw // 2, y + fh // 2)
+    if next_center is None:
+        next_center = (src_w // 2, src_h // 2)
 
                 if last_center is None:
                     last_center = next_center
